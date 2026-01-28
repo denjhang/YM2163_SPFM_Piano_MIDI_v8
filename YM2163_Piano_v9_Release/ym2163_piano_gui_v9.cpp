@@ -1,0 +1,3825 @@
+// YM2163 Piano GUI v8 - ImGui + DirectX 11 + MIDI File Player + Dual YM2163
+// Features: 4-octave keyboard, drums, tuning component, MIDI file playback
+// Modern UI with ImGui framework
+
+#include "imgui/imgui.h"
+#include "imgui/imgui_impl_win32.h"
+#include "imgui/imgui_impl_dx11.h"
+#include <d3d11.h>
+#include <windows.h>
+#include <commdlg.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <string>
+#include <vector>
+#include <map>
+#include <algorithm>
+#include <chrono>
+#include <random>
+#include <mmsystem.h>  // For multimedia timer
+
+extern "C" {
+#include "ftdi_driver/ftd2xx.h"
+}
+
+// Include midifile library
+#include "midifile/include/MidiFile.h"
+using namespace smf;
+
+// ===== Global Variables =====
+
+// DirectX 11 globals
+static ID3D11Device*            g_pd3dDevice = nullptr;
+static ID3D11DeviceContext*     g_pd3dDeviceContext = nullptr;
+static IDXGISwapChain*          g_pSwapChain = nullptr;
+static bool                     g_SwapChainOccluded = false;
+static UINT                     g_ResizeWidth = 0, g_ResizeHeight = 0;
+static ID3D11RenderTargetView*  g_mainRenderTargetView = nullptr;
+
+// FTDI and YM2163
+static FT_HANDLE g_ftHandle = NULL;
+
+// UI State
+static int g_currentOctave = 2;
+static bool g_keyStates[256] = {0};
+static std::string g_logBuffer;
+static bool g_autoScroll = true;
+static char g_logDisplayBuffer[32768] = {0};
+static size_t g_lastLogSize = 0;
+static bool g_logScrollToBottom = false;
+
+// YM2163 Settings
+static int g_currentTimbre = 4;
+static int g_currentEnvelope = 1;
+static int g_currentVolume = 0;
+static bool g_useLiveControl = false;  // true=Live Control Mode, false=Config Mode (default: Config Mode)
+static int g_selectedInstrument = 0;  // Currently selected instrument (0-127) for editing
+static bool g_enableVelocityMapping = true;  // Map MIDI velocity to 4-level volume
+static bool g_enableDynamicVelocityMapping = true;  // Dynamic velocity mapping based on MIDI analysis (default: ON)
+static bool g_enableSustainPedal = true;  // Map sustain pedal to envelope
+static bool g_sustainPedalActive = false;  // Current sustain pedal state
+static bool g_enableSecondYM2163 = true;  // Enable second YM2163 chip (Slot1) for 8 channels total - DEFAULT ON
+
+// Dynamic velocity mapping state
+struct VelocityAnalysis {
+    int velocityHistogram[128];  // Count of each velocity value
+    int totalNotes;
+    int minVelocity;
+    int maxVelocity;
+    float avgVelocity;
+    int peakVelocity;
+    int mostCommonVelocity1;  // Most frequent velocity
+    int mostCommonVelocity2;  // Second most frequent velocity
+
+    // Calculated mapping thresholds
+    int threshold_0dB;    // Velocities >= this map to 0dB (max volume)
+    int threshold_6dB;    // Velocities >= this map to -6dB
+    int threshold_12dB;   // Velocities >= this map to -12dB
+    int threshold_mute;   // Velocities < this map to mute
+
+    VelocityAnalysis() {
+        memset(velocityHistogram, 0, sizeof(velocityHistogram));
+        totalNotes = 0;
+        minVelocity = 127;
+        maxVelocity = 0;
+        avgVelocity = 0.0f;
+        peakVelocity = 0;
+        mostCommonVelocity1 = 64;
+        mostCommonVelocity2 = 80;
+        threshold_0dB = 100;
+        threshold_6dB = 80;
+        threshold_12dB = 60;
+        threshold_mute = 20;
+    }
+};
+
+static VelocityAnalysis g_velocityAnalysis;
+
+static const char* g_timbreNames[] = {
+    "", "String", "Organ", "Clarinet", "Piano", "Harpsichord"
+};
+
+static const char* g_envelopeNames[] = {
+    "Decay", "Fast", "Medium", "Slow"
+};
+
+static const char* g_volumeNames[] = {
+    "0dB", "-6dB", "-12dB", "Mute"
+};
+
+// Channel state
+typedef struct {
+    int note;
+    int octave;
+    uint16_t fnum;
+    bool active;
+    int midiChannel;  // Track which MIDI channel this is assigned to
+    int timbre;       // Current timbre (wave) setting
+    int envelope;     // Current envelope setting
+    int volume;       // Current volume setting
+    int chipIndex;    // Which YM2163 chip (0=Slot0, 1=Slot1)
+    std::chrono::steady_clock::time_point startTime;  // When this note started playing
+    std::chrono::steady_clock::time_point releaseTime;  // When this note was released (stop_note called)
+    bool hasBeenUsed;  // Whether this channel has ever been used
+} ChannelState;
+
+// 8 channels total: 4 on Slot0 (chip 0) + 4 on Slot1 (chip 1, optional)
+static ChannelState g_channels[8] = {
+    {0, 0, 0, false, -1, 0, 0, 0, 0, {}, {}, false},  // Chip 0, Channel 0
+    {0, 0, 0, false, -1, 0, 0, 0, 0, {}, {}, false},  // Chip 0, Channel 1
+    {0, 0, 0, false, -1, 0, 0, 0, 0, {}, {}, false},  // Chip 0, Channel 2
+    {0, 0, 0, false, -1, 0, 0, 0, 0, {}, {}, false},  // Chip 0, Channel 3
+    {0, 0, 0, false, -1, 0, 0, 0, 1, {}, {}, false},  // Chip 1, Channel 0
+    {0, 0, 0, false, -1, 0, 0, 0, 1, {}, {}, false},  // Chip 1, Channel 1
+    {0, 0, 0, false, -1, 0, 0, 0, 1, {}, {}, false},  // Chip 1, Channel 2
+    {0, 0, 0, false, -1, 0, 0, 0, 1, {}, {}, false}   // Chip 1, Channel 3
+};
+static int g_nextFIFOChannel = 0;  // FIFO channel allocation index
+
+// Drum pads
+static bool g_drumPressed[5] = {false};
+static bool g_drumActive[5] = {false};  // Track drum active state
+static const char* g_drumNames[] = {"BD", "HC", "SDN", "HHO", "HHD"};
+static uint8_t g_drumBits[] = {0x01, 0x02, 0x04, 0x08, 0x10};
+static std::chrono::steady_clock::time_point g_drumTriggerTime[5];
+
+// Piano keys state
+static bool g_pianoKeyPressed[61] = {false};
+static int g_pianoKeyVelocity[61] = {0};  // Store velocity (0-127) for each key
+static bool g_pianoKeyFromKeyboard[61] = {false};  // Track if key was triggered by keyboard (not MIDI)
+
+// Frequency tables
+static int g_fnums[12] = {
+    951, 900, 852, 803, 756, 716, 674, 637, 601, 567, 535, 507
+};
+
+static int g_fnum_b2 = 1014;
+
+static int g_fnums_c7[12] = {
+    475, 450, 426, 401, 378, 358, 337, 318, 300, 283, 267, 0
+};
+
+static const char* g_noteNames[12] = {
+    "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"
+};
+
+static const bool g_isBlackNote[12] = {
+    false, true, false, true, false, false, true, false, true, false, true, false
+};
+
+// INI file paths
+static char g_iniFilePath[MAX_PATH] = {0};
+static char g_midiConfigPath[MAX_PATH] = {0};
+
+// ===== MIDI Configuration Structures =====
+
+struct InstrumentConfig {
+    std::string name;
+    int envelope;  // 0=Decay, 1=Fast, 2=Medium, 3=Slow
+    int wave;      // 1=String, 2=Organ, 3=Clarinet, 4=Piano, 5=Harpsichord
+};
+
+struct DrumConfig {
+    std::string name;
+    std::vector<uint8_t> drumBits;  // Can have multiple drums combined
+};
+
+static std::map<int, InstrumentConfig> g_instrumentConfigs;
+static std::map<int, DrumConfig> g_drumConfigs;
+
+// ===== MIDI Player State =====
+
+struct MidiPlayerState {
+    MidiFile midiFile;
+    std::string currentFileName;
+    bool isPlaying;
+    bool isPaused;
+    int currentTick;
+    std::chrono::steady_clock::time_point playStartTime;
+    std::chrono::steady_clock::time_point pauseTime;
+    std::chrono::milliseconds pausedDuration;
+    double tempo;  // microseconds per quarter note
+    int ticksPerQuarterNote;
+
+    // High-precision timer for accurate MIDI playback (yasp-style optimization)
+    LARGE_INTEGER perfCounterFreq;
+    LARGE_INTEGER lastPerfCounter;
+    double accumulatedTime;  // Accumulated microseconds for precise timing
+
+    // Track which notes are currently playing for each MIDI channel
+    std::map<int, std::map<int, int>> activeNotes;  // channel -> note -> YM2163 channel
+
+    MidiPlayerState() : isPlaying(false), isPaused(false), currentTick(0),
+                        tempo(500000.0), ticksPerQuarterNote(120),
+                        pausedDuration(0), accumulatedTime(0.0) {
+        // Initialize high-precision counter
+        QueryPerformanceFrequency(&perfCounterFreq);
+        QueryPerformanceCounter(&lastPerfCounter);
+    }
+};
+
+static MidiPlayerState g_midiPlayer;
+
+// ===== File Browser State =====
+
+struct FileEntry {
+    std::string name;
+    std::string fullPath;
+    bool isDirectory;
+};
+
+static char g_currentPath[MAX_PATH] = {0};
+static char g_pathInput[MAX_PATH] = {0};
+static std::vector<FileEntry> g_fileList;
+static std::vector<std::string> g_pathHistory;
+static int g_pathHistoryIndex = -1;
+static int g_selectedFileIndex = -1;
+static bool g_pathEditMode = false;  // Win11-style address bar: false=breadcrumb buttons, true=text input
+static bool g_pathEditModeJustActivated = false;  // Track if edit mode was just activated this frame
+
+// Playlist control
+static int g_currentPlayingIndex = -1;  // Index in g_fileList
+static bool g_isSequentialPlayback = true;  // true=Sequential, false=Random
+static bool g_autoPlayNext = true;  // Auto-play next track when current finishes (default: enabled)
+
+// MIDI Folder history
+static std::vector<std::string> g_midiFolderHistory;  // History of folders containing MIDI files
+static const char* g_midiFolderHistoryFile = "ym2163_folder_history.ini";
+
+// Timer for MIDI playback during window drag
+#define TIMER_MIDI_UPDATE 1
+static bool g_isWindowDragging = false;
+
+// Tuning window control
+static bool g_showTuningWindow = false;
+
+// Input focus state
+static bool g_isInputActive = false;  // Track if any input field is being edited
+
+// Global media keys support
+static bool g_enableGlobalMediaKeys = true;  // Default enabled
+static HWND g_mainWindow = NULL;
+
+// MIDI playback options
+static bool g_enableAutoSkipSilence = true;  // Auto-skip silence at start of MIDI
+
+// Hot key IDs
+#define HK_PLAY_PAUSE 1001
+#define HK_NEXT_TRACK 1002
+#define HK_PREV_TRACK 1003
+
+// ===== Forward Declarations =====
+void log_command(const char* format, ...);
+void stop_note(int channel);
+void PlayMIDI();
+void StopMIDI();
+void PlayNextMIDI();
+void PlayPreviousMIDI();
+void AddToMIDIFolderHistory(const char* folderPath);
+void SaveMIDIFolderHistory();
+void LoadMIDIFolderHistory();
+void ClearMIDIFolderHistory();
+void RemoveMIDIFolderHistoryEntry(int index);
+bool ContainsMIDIFiles(const char* folderPath);
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
+// ===== FTDI Communication =====
+
+static uint8_t g_lastRegAddr = 0xFF;
+static bool g_expectingData = false;
+
+int ftdi_init(int dev_idx) {
+    FT_STATUS status;
+
+    DWORD numDevs = 0;
+    status = FT_CreateDeviceInfoList(&numDevs);
+    if (status == FT_OK && numDevs > 0) {
+        log_command("=== FTDI Device Detection ===");
+        log_command("Found %lu FTDI device(s)", numDevs);
+
+        FT_DEVICE_LIST_INFO_NODE *devInfo = (FT_DEVICE_LIST_INFO_NODE*)
+            malloc(sizeof(FT_DEVICE_LIST_INFO_NODE) * numDevs);
+        status = FT_GetDeviceInfoList(devInfo, &numDevs);
+
+        if (status == FT_OK) {
+            for (DWORD i = 0; i < numDevs; i++) {
+                log_command("Device %lu: %s (Serial: %s)",
+                    i, devInfo[i].Description, devInfo[i].SerialNumber);
+            }
+        }
+        free(devInfo);
+    }
+
+    log_command("Opening device index %d...", dev_idx);
+    status = FT_Open(dev_idx, &g_ftHandle);
+    if (status != FT_OK) {
+        log_command("ERROR: Failed to open device (status=%d)", status);
+        return -1;
+    }
+
+    log_command("Configuring FTDI parameters...");
+    FT_SetBaudRate(g_ftHandle, 1500000);
+    FT_SetDataCharacteristics(g_ftHandle, FT_BITS_8, FT_STOP_BITS_1, FT_PARITY_NONE);
+    FT_SetFlowControl(g_ftHandle, FT_FLOW_NONE, 0, 0);
+    FT_SetTimeouts(g_ftHandle, 100, 100);
+    FT_SetLatencyTimer(g_ftHandle, 2);
+    FT_Purge(g_ftHandle, FT_PURGE_RX | FT_PURGE_TX);
+
+    log_command("FTDI initialized successfully");
+    return 0;
+}
+
+// Write to YM2163 melody channel with chip selection
+// chipIndex: 0=Slot0, 1=Slot1
+void write_melody_cmd_chip(uint8_t data, int chipIndex) {
+    if (!g_ftHandle) return;
+    // SPFM format: {slot_select, command, data}
+    // Slot0: 0x00, Slot1: 0x01
+    uint8_t cmd[3] = {(uint8_t)chipIndex, 0x80, data};
+    DWORD written;
+    FT_Write(g_ftHandle, cmd, 3, &written);
+    FT_Purge(g_ftHandle, FT_PURGE_TX);
+
+    if (!g_expectingData) {
+        g_lastRegAddr = data;
+        g_expectingData = true;
+    } else {
+        g_expectingData = false;
+    }
+}
+
+// Legacy function for backward compatibility (uses Slot0)
+void write_melody_cmd(uint8_t data) {
+    write_melody_cmd_chip(data, 0);
+}
+
+// Initialize one YM2163 chip
+void init_single_ym2163(int chipIndex) {
+    log_command(chipIndex == 0 ? "=== Initializing YM2163 Slot0 ===" : "=== Initializing YM2163 Slot1 ===");
+
+    for (int ch = 0; ch < 4; ch++) {
+        write_melody_cmd_chip(0x88 + ch, chipIndex);
+        write_melody_cmd_chip(0x14, chipIndex);
+        write_melody_cmd_chip(0x8C + ch, chipIndex);
+        write_melody_cmd_chip(0x0F, chipIndex);
+        write_melody_cmd_chip(0x84 + ch, chipIndex);
+        write_melody_cmd_chip(0x00, chipIndex);
+    }
+
+    for (int reg = 0x94; reg <= 0x97; reg++) {
+        write_melody_cmd_chip(reg, chipIndex);
+        write_melody_cmd_chip((31 << 1) | 0, chipIndex);
+    }
+
+    write_melody_cmd_chip(0x90, chipIndex);
+    write_melody_cmd_chip(0x00, chipIndex);
+
+    write_melody_cmd_chip(0x98, chipIndex); write_melody_cmd_chip(0x00, chipIndex);
+    write_melody_cmd_chip(0x99, chipIndex); write_melody_cmd_chip(0x0D, chipIndex);
+    write_melody_cmd_chip(0x9C, chipIndex); write_melody_cmd_chip(0x04, chipIndex);
+    write_melody_cmd_chip(0x9D, chipIndex); write_melody_cmd_chip(0x04, chipIndex);
+
+    log_command(chipIndex == 0 ? "YM2163 Slot0 initialized" : "YM2163 Slot1 initialized");
+}
+
+void ym2163_init() {
+    uint8_t reset_cmd[4] = {0, 0, 0xFE, 0};
+    DWORD written;
+    FT_Write(g_ftHandle, reset_cmd, 4, &written);
+    FT_Purge(g_ftHandle, FT_PURGE_TX);
+    Sleep(200);
+
+    log_command("=== YM2163 Initialization ===");
+
+    // Always initialize Slot0
+    init_single_ym2163(0);
+
+    // Initialize Slot1 if enabled
+    if (g_enableSecondYM2163) {
+        init_single_ym2163(1);
+        log_command("Dual YM2163 mode active (8 channels)");
+    } else {
+        log_command("Single YM2163 mode active (4 channels)");
+    }
+}
+
+// ===== Logging =====
+
+void log_command(const char* format, ...) {
+    char temp[256];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(temp, sizeof(temp), format, args);
+    va_end(args);
+
+    g_logBuffer += temp;
+    g_logBuffer += "\n";
+
+    if (g_logBuffer.size() > 32000) {
+        g_logBuffer.erase(0, 8000);
+    }
+}
+
+// ===== Helper Functions =====
+
+int get_key_index(int octave, int note) {
+    if (octave == 0 && note == 11) {
+        return 0;
+    } else if (octave >= 1 && octave <= 5) {
+        return (octave - 1) * 12 + note + 1;
+    }
+    return -1;
+}
+
+// ===== Configuration File Loading =====
+
+void LoadMIDIConfig() {
+    log_command("=== Loading MIDI Configuration ===");
+
+    // Parse instrument configs (0-127)
+    for (int i = 0; i < 128; i++) {
+        char section[32];
+        sprintf(section, "Instrument_%d", i);
+
+        char name[128];
+        char envelope[32];
+        char wave[32];
+
+        GetPrivateProfileStringA(section, "Name", "", name, sizeof(name), g_midiConfigPath);
+        GetPrivateProfileStringA(section, "Envelope", "Decay", envelope, sizeof(envelope), g_midiConfigPath);
+        GetPrivateProfileStringA(section, "Wave", "Piano", wave, sizeof(wave), g_midiConfigPath);
+
+        InstrumentConfig config;
+        config.name = name;
+
+        // Parse envelope
+        if (strcmp(envelope, "Decay") == 0) config.envelope = 0;
+        else if (strcmp(envelope, "Fast") == 0) config.envelope = 1;
+        else if (strcmp(envelope, "Medium") == 0) config.envelope = 2;
+        else if (strcmp(envelope, "Slow") == 0) config.envelope = 3;
+        else config.envelope = 0;
+
+        // Parse wave
+        if (strcmp(wave, "String") == 0) config.wave = 1;
+        else if (strcmp(wave, "Organ") == 0) config.wave = 2;
+        else if (strcmp(wave, "Clarinet") == 0) config.wave = 3;
+        else if (strcmp(wave, "Piano") == 0) config.wave = 4;
+        else if (strcmp(wave, "Harpsichord") == 0) config.wave = 5;
+        else config.wave = 4;
+
+        g_instrumentConfigs[i] = config;
+    }
+
+    // Parse drum configs (note 27-63)
+    for (int i = 27; i <= 63; i++) {
+        char section[32];
+        sprintf(section, "Drum_%d", i);
+
+        char name[128];
+        char drums[128];
+
+        GetPrivateProfileStringA(section, "Name", "", name, sizeof(name), g_midiConfigPath);
+        GetPrivateProfileStringA(section, "Drums", "SDN", drums, sizeof(drums), g_midiConfigPath);
+
+        DrumConfig config;
+        config.name = name;
+
+        // Parse drum combinations (e.g., "BD,SDN")
+        char* token = strtok(drums, ",");
+        while (token != NULL) {
+            // Trim whitespace
+            while (*token == ' ') token++;
+
+            if (strcmp(token, "BD") == 0) config.drumBits.push_back(0x01);
+            else if (strcmp(token, "HC") == 0) config.drumBits.push_back(0x02);
+            else if (strcmp(token, "SDN") == 0) config.drumBits.push_back(0x04);
+            else if (strcmp(token, "HHO") == 0) config.drumBits.push_back(0x08);
+            else if (strcmp(token, "HHD") == 0) config.drumBits.push_back(0x10);
+
+            token = strtok(NULL, ",");
+        }
+
+        g_drumConfigs[i] = config;
+    }
+
+    log_command("MIDI configuration loaded: %d instruments, %d drums",
+                (int)g_instrumentConfigs.size(), (int)g_drumConfigs.size());
+}
+
+void SaveFrequenciesToINI() {
+    char buffer[32];
+
+    sprintf(buffer, "%d", g_fnum_b2);
+    WritePrivateProfileStringA("Frequencies", "B2", buffer, g_iniFilePath);
+
+    for (int i = 0; i < 12; i++) {
+        sprintf(buffer, "%d", g_fnums[i]);
+        WritePrivateProfileStringA("Frequencies", g_noteNames[i], buffer, g_iniFilePath);
+    }
+
+    for (int i = 0; i < 12; i++) {
+        sprintf(buffer, "%d", g_fnums_c7[i]);
+        WritePrivateProfileStringA("Frequencies_C7", g_noteNames[i], buffer, g_iniFilePath);
+    }
+}
+
+void LoadFrequenciesFromINI() {
+    UINT b2_value = GetPrivateProfileIntA("Frequencies", "B2", 0, g_iniFilePath);
+    if (b2_value > 0 && b2_value <= 2047) {
+        g_fnum_b2 = b2_value;
+    }
+
+    for (int i = 0; i < 12; i++) {
+        UINT value = GetPrivateProfileIntA("Frequencies", g_noteNames[i], 0, g_iniFilePath);
+        if (value > 0 && value <= 2047) {
+            g_fnums[i] = value;
+        }
+    }
+
+    for (int i = 0; i < 12; i++) {
+        UINT value = GetPrivateProfileIntA("Frequencies_C7", g_noteNames[i], 0, g_iniFilePath);
+        if (value >= 0 && value <= 2047) {
+            g_fnums_c7[i] = value;
+        }
+    }
+}
+
+// Save current instrument settings to config file
+void SaveInstrumentConfig(int instrument) {
+    if (instrument < 0 || instrument > 127) return;
+
+    char section[32];
+    sprintf(section, "Instrument_%d", instrument);
+
+    // Convert current settings to strings
+    const char* envelopeStr = g_envelopeNames[g_currentEnvelope];
+    const char* waveStr = g_timbreNames[g_currentTimbre];
+
+    WritePrivateProfileStringA(section, "Envelope", envelopeStr, g_midiConfigPath);
+    WritePrivateProfileStringA(section, "Wave", waveStr, g_midiConfigPath);
+
+    // Update in-memory config
+    if (g_instrumentConfigs.count(instrument) > 0) {
+        g_instrumentConfigs[instrument].envelope = g_currentEnvelope;
+        g_instrumentConfigs[instrument].wave = g_currentTimbre;
+    }
+
+    log_command("Saved Instrument %d: %s, %s", instrument, waveStr, envelopeStr);
+}
+
+// Load instrument settings from config to UI
+void LoadInstrumentConfigToUI(int instrument) {
+    if (instrument < 0 || instrument > 127) return;
+
+    if (g_instrumentConfigs.count(instrument) > 0) {
+        InstrumentConfig& config = g_instrumentConfigs[instrument];
+        g_currentEnvelope = config.envelope;
+        g_currentTimbre = config.wave;
+        log_command("Loaded Instrument %d (%s): %s, %s",
+                    instrument, config.name.c_str(),
+                    g_timbreNames[g_currentTimbre],
+                    g_envelopeNames[g_currentEnvelope]);
+    }
+}
+
+// ===== YM2163 Control Functions =====
+
+// Helper function: Calculate absolute pitch for comparison (higher value = higher pitch)
+int get_absolute_pitch(int note, int octave) {
+    return octave * 12 + note;
+}
+
+// Helper function: Check if note is within YM2163 valid range (B2 to B7)
+bool is_in_valid_range(int note, int octave) {
+    // B2 is octave=0, note=11
+    if (octave == 0 && note == 11) return true;
+    // C3-B7 is octave=1-5
+    if (octave >= 1 && octave <= 5) return true;
+    return false;
+}
+
+// Helper function: Map MIDI velocity (0-127) to YM2163 4-level volume
+// Two modes: Fixed mapping or Dynamic mapping based on MIDI analysis
+int map_velocity_to_volume(int velocity) {
+    if (!g_enableDynamicVelocityMapping) {
+        // Fixed mapping (original behavior)
+        // velocity 0 -> volume 3 (Mute) - only for velocity 0
+        // velocity 1-63 -> volume 2 (-12dB) - soft notes
+        // velocity 64-112 -> volume 1 (-6dB) - medium to strong notes
+        // velocity 113-127 -> volume 0 (0dB) - only very strong notes
+        if (velocity == 0) return 3;  // Mute only for velocity 0
+        if (velocity <= 63) return 2;  // -12dB for softer velocities
+        if (velocity <= 112) return 1;  // -6dB for medium to strong velocities
+        return 0;  // 0dB only for very strong velocities (113-127)
+    } else {
+        // Dynamic mapping based on analyzed velocity distribution
+        if (velocity < g_velocityAnalysis.threshold_mute) {
+            return 3;  // Mute for very soft notes
+        } else if (velocity < g_velocityAnalysis.threshold_12dB) {
+            return 2;  // -12dB for soft notes
+        } else if (velocity < g_velocityAnalysis.threshold_6dB) {
+            return 1;  // -6dB for medium notes
+        } else if (velocity < g_velocityAnalysis.threshold_0dB) {
+            return 1;  // -6dB for strong notes (prefer -6dB over 0dB)
+        } else {
+            return 0;  // 0dB only for peak velocities
+        }
+    }
+}
+
+// Analyze velocity distribution in MIDI file
+void AnalyzeVelocityDistribution() {
+    // Reset analysis
+    g_velocityAnalysis = VelocityAnalysis();
+
+    if (!g_midiPlayer.midiFile.status()) {
+        log_command("No MIDI file loaded for velocity analysis");
+        return;
+    }
+
+    // Scan all note-on events in the MIDI file
+    for (int track = 0; track < g_midiPlayer.midiFile.getTrackCount(); track++) {
+        for (int event = 0; event < g_midiPlayer.midiFile[track].getEventCount(); event++) {
+            MidiEvent& midiEvent = g_midiPlayer.midiFile[track][event];
+
+            if (midiEvent.isNoteOn()) {
+                int velocity = midiEvent.getVelocity();
+                if (velocity > 0) {  // Ignore note-off (velocity 0)
+                    g_velocityAnalysis.velocityHistogram[velocity]++;
+                    g_velocityAnalysis.totalNotes++;
+
+                    if (velocity < g_velocityAnalysis.minVelocity) {
+                        g_velocityAnalysis.minVelocity = velocity;
+                    }
+                    if (velocity > g_velocityAnalysis.maxVelocity) {
+                        g_velocityAnalysis.maxVelocity = velocity;
+                    }
+                }
+            }
+        }
+    }
+
+    if (g_velocityAnalysis.totalNotes == 0) {
+        log_command("No notes found in MIDI file");
+        return;
+    }
+
+    // Calculate average velocity
+    long long sum = 0;
+    for (int i = 0; i < 128; i++) {
+        sum += i * g_velocityAnalysis.velocityHistogram[i];
+    }
+    g_velocityAnalysis.avgVelocity = (float)sum / g_velocityAnalysis.totalNotes;
+
+    // Find most common velocities
+    int maxCount1 = 0, maxCount2 = 0;
+    for (int i = 1; i < 128; i++) {  // Skip velocity 0
+        if (g_velocityAnalysis.velocityHistogram[i] > maxCount1) {
+            maxCount2 = maxCount1;
+            g_velocityAnalysis.mostCommonVelocity2 = g_velocityAnalysis.mostCommonVelocity1;
+            maxCount1 = g_velocityAnalysis.velocityHistogram[i];
+            g_velocityAnalysis.mostCommonVelocity1 = i;
+        } else if (g_velocityAnalysis.velocityHistogram[i] > maxCount2) {
+            maxCount2 = g_velocityAnalysis.velocityHistogram[i];
+            g_velocityAnalysis.mostCommonVelocity2 = i;
+        }
+    }
+
+    // Find peak velocity (95th percentile to avoid outliers)
+    int cumulativeCount = 0;
+    int percentile95 = (int)(g_velocityAnalysis.totalNotes * 0.95f);
+    for (int i = 127; i >= 0; i--) {
+        cumulativeCount += g_velocityAnalysis.velocityHistogram[i];
+        if (cumulativeCount >= (g_velocityAnalysis.totalNotes - percentile95)) {
+            g_velocityAnalysis.peakVelocity = i;
+            break;
+        }
+    }
+
+    // Calculate dynamic thresholds
+    // Strategy:
+    // - Map most common velocities to -6dB and -12dB (most used levels)
+    // - Map peak velocities to 0dB (maximum volume)
+    // - Map very low velocities to mute
+
+    int vel1 = g_velocityAnalysis.mostCommonVelocity1;
+    int vel2 = g_velocityAnalysis.mostCommonVelocity2;
+
+    // Ensure vel1 > vel2 for easier threshold calculation
+    if (vel1 < vel2) {
+        int temp = vel1;
+        vel1 = vel2;
+        vel2 = temp;
+    }
+
+    // Set thresholds based on velocity distribution
+    // 0dB: Peak velocities (top 10%)
+    g_velocityAnalysis.threshold_0dB = g_velocityAnalysis.peakVelocity;
+
+    // -6dB: Higher of the two most common velocities
+    g_velocityAnalysis.threshold_6dB = (vel1 + vel2) / 2;
+
+    // -12dB: Lower of the two most common velocities
+    g_velocityAnalysis.threshold_12dB = vel2 - (vel1 - vel2) / 2;
+
+    // Mute: Very low velocities (below 15% of average)
+    g_velocityAnalysis.threshold_mute = (int)(g_velocityAnalysis.avgVelocity * 0.15f);
+
+    // Clamp thresholds to valid ranges
+    if (g_velocityAnalysis.threshold_mute < 1) g_velocityAnalysis.threshold_mute = 1;
+    if (g_velocityAnalysis.threshold_12dB < 20) g_velocityAnalysis.threshold_12dB = 20;
+    if (g_velocityAnalysis.threshold_6dB < 40) g_velocityAnalysis.threshold_6dB = 40;
+    if (g_velocityAnalysis.threshold_0dB < 90) g_velocityAnalysis.threshold_0dB = 90;
+
+    // Ensure proper ordering
+    if (g_velocityAnalysis.threshold_12dB <= g_velocityAnalysis.threshold_mute) {
+        g_velocityAnalysis.threshold_12dB = g_velocityAnalysis.threshold_mute + 10;
+    }
+    if (g_velocityAnalysis.threshold_6dB <= g_velocityAnalysis.threshold_12dB) {
+        g_velocityAnalysis.threshold_6dB = g_velocityAnalysis.threshold_12dB + 10;
+    }
+    if (g_velocityAnalysis.threshold_0dB <= g_velocityAnalysis.threshold_6dB) {
+        g_velocityAnalysis.threshold_0dB = g_velocityAnalysis.threshold_6dB + 10;
+    }
+
+    log_command("=== Velocity Analysis ===");
+    log_command("Total notes: %d", g_velocityAnalysis.totalNotes);
+    log_command("Velocity range: %d - %d", g_velocityAnalysis.minVelocity, g_velocityAnalysis.maxVelocity);
+    log_command("Average velocity: %.1f", g_velocityAnalysis.avgVelocity);
+    log_command("Peak velocity (95%%): %d", g_velocityAnalysis.peakVelocity);
+    log_command("Most common velocities: %d (count: %d), %d (count: %d)",
+                g_velocityAnalysis.mostCommonVelocity1, maxCount1,
+                g_velocityAnalysis.mostCommonVelocity2, maxCount2);
+    log_command("Dynamic thresholds:");
+    log_command("  0dB: >= %d", g_velocityAnalysis.threshold_0dB);
+    log_command("  -6dB: %d - %d", g_velocityAnalysis.threshold_6dB, g_velocityAnalysis.threshold_0dB - 1);
+    log_command("  -12dB: %d - %d", g_velocityAnalysis.threshold_12dB, g_velocityAnalysis.threshold_6dB - 1);
+    log_command("  Mute: < %d", g_velocityAnalysis.threshold_mute);
+}
+
+// Minimum note duration before it can be replaced (in milliseconds)
+static const int MIN_NOTE_DURATION_MS = 50;
+
+int find_free_channel() {
+    // Determine max channels based on second chip enable status
+    int maxChannels = g_enableSecondYM2163 ? 8 : 4;
+
+    // Strategy 1: Find completely unused channels (never been used before)
+    for (int i = 0; i < maxChannels; i++) {
+        if (!g_channels[i].active && !g_channels[i].hasBeenUsed) {
+            g_channels[i].hasBeenUsed = true;
+            return i;
+        }
+    }
+
+    // Strategy 2: Find free channels (released but previously used)
+    // Prefer channels that were released longest ago (envelope has more time to complete)
+    int bestFreeChannel = -1;
+    auto oldestReleaseTime = std::chrono::steady_clock::now();
+
+    for (int i = 0; i < maxChannels; i++) {
+        if (!g_channels[i].active && g_channels[i].hasBeenUsed) {
+            // This channel is free and has been used before
+            if (bestFreeChannel < 0 || g_channels[i].releaseTime < oldestReleaseTime) {
+                bestFreeChannel = i;
+                oldestReleaseTime = g_channels[i].releaseTime;
+            }
+        }
+    }
+
+    if (bestFreeChannel >= 0) {
+        return bestFreeChannel;
+    }
+
+    // Strategy 3: No free channels - use intelligent strategy to choose which channel to replace
+    // Priority:
+    // 1. Replace out-of-range notes first
+    // 2. Among valid-range notes, prefer replacing lower-pitched notes (high pitch priority)
+    // 3. Prefer notes that have played for at least MIN_NOTE_DURATION_MS
+
+    auto now = std::chrono::steady_clock::now();
+
+    int channelToReplace = -1;
+    int lowestOutOfRangePitch = INT_MAX;
+    int lowestInRangePitch = INT_MAX;
+    bool hasOutOfRange = false;
+
+    // Track which channels have played long enough
+    bool canReplace[8] = {false};
+    for (int i = 0; i < maxChannels; i++) {
+        if (g_channels[i].active) {
+            auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - g_channels[i].startTime);
+
+            // Adjust minimum duration based on envelope type
+            int minDuration = MIN_NOTE_DURATION_MS;
+            if (g_channels[i].envelope == 0) {  // Decay envelope: ~1 second release
+                minDuration = 1000;  // 1 second to allow full envelope release
+            } else if (g_channels[i].envelope == 1) {  // Fast envelope
+                minDuration = 500;   // 500ms
+            } else if (g_channels[i].envelope == 2) {  // Medium envelope
+                minDuration = 2000;  // 2 seconds
+            } else if (g_channels[i].envelope == 3) {  // Slow envelope
+                minDuration = 3000;  // 3 seconds
+            }
+
+            canReplace[i] = (duration.count() >= minDuration);
+        }
+    }
+
+    for (int i = 0; i < maxChannels; i++) {
+        if (!g_channels[i].active) continue;
+
+        int pitch = get_absolute_pitch(g_channels[i].note, g_channels[i].octave);
+        bool inRange = is_in_valid_range(g_channels[i].note, g_channels[i].octave);
+
+        if (!inRange) {
+            // Out of range note found
+            hasOutOfRange = true;
+            // Prefer out-of-range notes that have played long enough
+            if (canReplace[i] && pitch < lowestOutOfRangePitch) {
+                lowestOutOfRangePitch = pitch;
+                channelToReplace = i;
+            } else if (!canReplace[i] && channelToReplace < 0) {
+                // If no replaceable out-of-range notes found yet, use this as fallback
+                lowestOutOfRangePitch = pitch;
+                channelToReplace = i;
+            }
+        } else {
+            // Valid range note
+            if (canReplace[i] && pitch < lowestInRangePitch) {
+                lowestInRangePitch = pitch;
+            }
+        }
+    }
+
+    // If we found out-of-range notes, replace one
+    if (hasOutOfRange && channelToReplace >= 0) {
+        stop_note(channelToReplace);
+        return channelToReplace;
+    }
+
+    // All notes are in valid range - replace the lowest pitch note that has played long enough
+    for (int i = 0; i < maxChannels; i++) {
+        if (!g_channels[i].active) continue;
+
+        int pitch = get_absolute_pitch(g_channels[i].note, g_channels[i].octave);
+
+        // Find the lowest pitch note that can be replaced
+        if (canReplace[i] && pitch == lowestInRangePitch) {
+            channelToReplace = i;
+            break;
+        }
+    }
+
+    // If no long-enough notes found, replace any lowest pitch note as last resort
+    if (channelToReplace < 0) {
+        int lowestValidPitch = INT_MAX;
+        for (int i = 0; i < maxChannels; i++) {
+            if (!g_channels[i].active) continue;
+            int pitch = get_absolute_pitch(g_channels[i].note, g_channels[i].octave);
+            if (pitch < lowestValidPitch) {
+                lowestValidPitch = pitch;
+                channelToReplace = i;
+            }
+        }
+    }
+
+    // Force stop the note on this channel
+    if (channelToReplace >= 0 && g_channels[channelToReplace].active) {
+        stop_note(channelToReplace);
+    }
+
+    return channelToReplace >= 0 ? channelToReplace : 0;  // Fallback to channel 0
+}
+
+int find_channel_playing(int note, int octave) {
+    int maxChannels = g_enableSecondYM2163 ? 8 : 4;
+    for (int i = 0; i < maxChannels; i++) {
+        if (g_channels[i].active &&
+            g_channels[i].note == note &&
+            g_channels[i].octave == octave) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+void play_note(int channel, int note, int octave, int timbre = -1, int envelope = -1, int volume = -1) {
+    if (channel < 0 || channel >= 8) return;
+
+    // Determine chip and local channel
+    int chipIndex = g_channels[channel].chipIndex;
+    int localChannel = channel % 4;  // 0-3 for each chip
+
+    uint16_t fnum;
+    uint8_t hw_octave;
+
+    if (octave == 0 && note == 11) {
+        fnum = g_fnum_b2;
+        hw_octave = 0;
+    } else if (octave >= 1 && octave <= 4) {
+        fnum = g_fnums[note];
+        hw_octave = (octave - 1) & 0x03;
+    } else if (octave == 5) {
+        fnum = g_fnums_c7[note];
+        hw_octave = 3;
+    } else {
+        return;
+    }
+
+    uint8_t fnum_low = fnum & 0x7F;
+    uint8_t fnum_high = (fnum >> 7) & 0x07;
+
+    g_channels[channel].note = note;
+    g_channels[channel].octave = octave;
+    g_channels[channel].fnum = fnum;
+    g_channels[channel].active = true;
+    g_channels[channel].startTime = std::chrono::steady_clock::now();  // Record start time
+
+    // Use provided timbre/envelope or fall back to current settings
+    int useTimbre = (timbre >= 0) ? timbre : g_currentTimbre;
+    int useEnvelope = (envelope >= 0) ? envelope : g_currentEnvelope;
+    int useVolume = (volume >= 0) ? volume : g_currentVolume;
+
+    // Store settings in channel state
+    g_channels[channel].timbre = useTimbre;
+    g_channels[channel].envelope = useEnvelope;
+    g_channels[channel].volume = useVolume;
+
+    write_melody_cmd_chip(0x88 + localChannel, chipIndex);
+    uint8_t timbre_val = (useTimbre & 0x07) | ((useEnvelope & 0x03) << 4);
+    write_melody_cmd_chip(timbre_val, chipIndex);
+
+    write_melody_cmd_chip(0x8C + localChannel, chipIndex);
+    write_melody_cmd_chip(0x0F | ((useVolume & 0x03) << 4), chipIndex);
+
+    write_melody_cmd_chip(0x84 + localChannel, chipIndex);
+    write_melody_cmd_chip((hw_octave << 3) | fnum_high, chipIndex);
+
+    write_melody_cmd_chip(0x80 + localChannel, chipIndex);
+    write_melody_cmd_chip(fnum_low, chipIndex);
+
+    write_melody_cmd_chip(0x84 + localChannel, chipIndex);
+    write_melody_cmd_chip(0x40 | (hw_octave << 3) | fnum_high, chipIndex);
+}
+
+void stop_note(int channel) {
+    if (channel < 0 || channel >= 8) return;
+
+    // Determine chip and local channel
+    int chipIndex = g_channels[channel].chipIndex;
+    int localChannel = channel % 4;
+
+    int note = g_channels[channel].note;
+    int octave = g_channels[channel].octave;
+    uint16_t fnum = g_channels[channel].fnum;
+
+    uint8_t hw_octave;
+    if (octave == 0 && note == 11) {
+        hw_octave = 0;
+    } else if (octave >= 1 && octave <= 4) {
+        hw_octave = (octave - 1) & 0x03;
+    } else if (octave == 5) {
+        hw_octave = 3;
+    } else {
+        return;
+    }
+
+    uint8_t fnum_low = fnum & 0x7F;
+    uint8_t fnum_high = (fnum >> 7) & 0x07;
+
+    write_melody_cmd_chip(0x80 + localChannel, chipIndex);
+    write_melody_cmd_chip(fnum_low, chipIndex);
+
+    write_melody_cmd_chip(0x84 + localChannel, chipIndex);
+    write_melody_cmd_chip((hw_octave << 3) | fnum_high, chipIndex);
+
+    // Clear piano key visual
+    int keyIdx = get_key_index(octave, note);
+    if (keyIdx >= 0 && keyIdx < 61) {
+        g_pianoKeyPressed[keyIdx] = false;
+    }
+
+    // Record release time for intelligent channel allocation
+    g_channels[channel].releaseTime = std::chrono::steady_clock::now();
+    g_channels[channel].active = false;
+    g_channels[channel].midiChannel = -1;
+}
+
+void stop_all_notes() {
+    int maxChannels = g_enableSecondYM2163 ? 8 : 4;
+    for (int i = 0; i < maxChannels; i++) {
+        if (g_channels[i].active) {
+            stop_note(i);
+
+            int keyIdx = get_key_index(g_channels[i].octave, g_channels[i].note);
+            if (keyIdx >= 0 && keyIdx < 61) {
+                g_pianoKeyPressed[keyIdx] = false;
+            }
+        }
+    }
+}
+
+// Reset YM2163 chip to eliminate residual sound/notes
+void ResetYM2163Chip(int chipIndex) {
+    if (!g_ftHandle) return;
+
+    log_command("Resetting YM2163 Chip %d...", chipIndex);
+
+    // Send all note-off commands for all 4 channels on this chip
+    for (int ch = 0; ch < 4; ch++) {
+        // Send note-off (key off) command: 0x88 + channel
+        write_melody_cmd_chip(0x88 + ch, chipIndex);
+        write_melody_cmd_chip(0x00, chipIndex);  // Key off
+    }
+
+    // Reset all volume to mute (volume = 3)
+    for (int ch = 0; ch < 4; ch++) {
+        write_melody_cmd_chip(0x8C + ch, chipIndex);
+        write_melody_cmd_chip(0x03, chipIndex);  // Mute
+    }
+
+    // Reset all envelope to decay
+    for (int ch = 0; ch < 4; ch++) {
+        write_melody_cmd_chip(0x84 + ch, chipIndex);
+        write_melody_cmd_chip(0x00, chipIndex);  // Decay envelope
+    }
+
+    // Reset all wave/timbre to 0
+    for (int ch = 0; ch < 4; ch++) {
+        write_melody_cmd_chip(0x80 + ch, chipIndex);
+        write_melody_cmd_chip(0x00, chipIndex);  // Timbre 0
+    }
+
+    // Reset rhythm section
+    write_melody_cmd_chip(0x90, chipIndex);
+    write_melody_cmd_chip(0x00, chipIndex);  // All rhythm off
+
+    log_command("YM2163 Chip %d reset complete", chipIndex);
+}
+
+// Reset all YM2163 chips to eliminate residual sound
+void ResetAllYM2163Chips() {
+    log_command("=== Resetting all YM2163 chips ===");
+
+    // Reset Slot0 (always present)
+    ResetYM2163Chip(0);
+
+    // Reset Slot1 if enabled
+    if (g_enableSecondYM2163) {
+        ResetYM2163Chip(1);
+    }
+
+    Sleep(50);  // Wait for chip to settle
+}
+
+// Initialize all channels to clean state (eliminate residual sound)
+void InitializeAllChannels() {
+    int maxChannels = g_enableSecondYM2163 ? 8 : 4;
+    auto now = std::chrono::steady_clock::now();
+
+    for (int i = 0; i < maxChannels; i++) {
+        g_channels[i].active = false;
+        g_channels[i].midiChannel = -1;
+        g_channels[i].note = 0;
+        g_channels[i].octave = 0;
+        g_channels[i].fnum = 0;
+        g_channels[i].timbre = 0;
+        g_channels[i].envelope = 0;
+        g_channels[i].volume = 0;
+        g_channels[i].startTime = now;
+        g_channels[i].releaseTime = now;
+        g_channels[i].hasBeenUsed = false;
+
+        // Clear piano key visual
+        int keyIdx = get_key_index(g_channels[i].octave, g_channels[i].note);
+        if (keyIdx >= 0 && keyIdx < 61) {
+            g_pianoKeyPressed[keyIdx] = false;
+        }
+    }
+
+    // Reset drum states
+    for (int i = 0; i < 5; i++) {
+        g_drumActive[i] = false;
+    }
+}
+
+// Clean up channels in Release phase that have exceeded timeout
+void play_drum(uint8_t rhythm_bit) {
+    write_melody_cmd(0x90);
+    write_melody_cmd(rhythm_bit);
+
+    // Track which drums were triggered
+    for (int i = 0; i < 5; i++) {
+        if (rhythm_bit & g_drumBits[i]) {
+            g_drumActive[i] = true;
+            g_drumTriggerTime[i] = std::chrono::steady_clock::now();
+        }
+    }
+}
+
+void UpdateDrumStates() {
+    // Auto-clear drum states after 100ms
+    auto now = std::chrono::steady_clock::now();
+    for (int i = 0; i < 5; i++) {
+        if (g_drumActive[i]) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - g_drumTriggerTime[i]);
+            if (elapsed.count() > 100) {
+                g_drumActive[i] = false;
+            }
+        }
+    }
+}
+
+void CleanupStuckChannels() {
+    // Force-release channels that have been active for more than 10 seconds
+    // This prevents "stuck" channels from permanently occupying slots
+    auto now = std::chrono::steady_clock::now();
+    int maxChannels = g_enableSecondYM2163 ? 8 : 4;
+
+    for (int i = 0; i < maxChannels; i++) {
+        if (g_channels[i].active) {
+            auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - g_channels[i].startTime);
+            if (duration.count() > 10000) {  // 10 seconds
+                // Force-stop this stuck channel
+                stop_note(i);
+            }
+        }
+    }
+}
+
+// ===== File Browser Functions =====
+
+// Helper functions for UTF-8 and wide character conversion
+std::string WideToUTF8(const std::wstring& wstr) {
+    if (wstr.empty()) return std::string();
+    int size_needed = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), (int)wstr.size(), NULL, 0, NULL, NULL);
+    std::string strTo(size_needed, 0);
+    WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), (int)wstr.size(), &strTo[0], size_needed, NULL, NULL);
+    return strTo;
+}
+
+std::wstring UTF8ToWide(const std::string& str) {
+    if (str.empty()) return std::wstring();
+    int size_needed = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), NULL, 0);
+    std::wstring wstrTo(size_needed, 0);
+    MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), &wstrTo[0], size_needed);
+    return wstrTo;
+}
+
+void RefreshFileList() {
+    g_fileList.clear();
+    g_selectedFileIndex = -1;
+
+    // Add parent directory entry if not at root
+    if (strlen(g_currentPath) > 3) {
+        FileEntry parent;
+        parent.name = "..";
+        parent.fullPath = "";
+        parent.isDirectory = true;
+        g_fileList.push_back(parent);
+    }
+
+    // Scan directory using wide character API for Unicode support
+    std::wstring wCurrentPath = UTF8ToWide(g_currentPath);
+    std::wstring wSearchPath = wCurrentPath + L"\\*";
+
+    WIN32_FIND_DATAW findData;
+    HANDLE hFind = FindFirstFileW(wSearchPath.c_str(), &findData);
+
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            // Skip "." and ".."
+            if (wcscmp(findData.cFileName, L".") == 0 || wcscmp(findData.cFileName, L"..") == 0) {
+                continue;
+            }
+
+            FileEntry entry;
+            entry.name = WideToUTF8(findData.cFileName);
+            std::wstring wFullPath = wCurrentPath + L"\\" + findData.cFileName;
+            entry.fullPath = WideToUTF8(wFullPath);
+            entry.isDirectory = (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+
+            // Add directories or .mid/.midi files only
+            if (entry.isDirectory) {
+                g_fileList.push_back(entry);
+            } else {
+                const wchar_t* ext = wcsrchr(findData.cFileName, L'.');
+                if (ext && (_wcsicmp(ext, L".mid") == 0 || _wcsicmp(ext, L".midi") == 0)) {
+                    g_fileList.push_back(entry);
+                }
+            }
+        } while (FindNextFileW(hFind, &findData));
+        FindClose(hFind);
+    }
+
+    // Sort: directories first, then files
+    std::sort(g_fileList.begin(), g_fileList.end(), [](const FileEntry& a, const FileEntry& b) {
+        if (a.name == "..") return true;
+        if (b.name == "..") return false;
+        if (a.isDirectory != b.isDirectory) return a.isDirectory;
+        return a.name < b.name;
+    });
+}
+
+void NavigateToPath(const char* path) {
+    // Convert to wide string for Unicode support
+    std::wstring wPath = UTF8ToWide(path);
+
+    // Normalize path
+    wchar_t wNormalizedPath[MAX_PATH];
+    if (GetFullPathNameW(wPath.c_str(), MAX_PATH, wNormalizedPath, NULL) == 0) {
+        log_command("ERROR: Invalid path: %s", path);
+        return;
+    }
+
+    // Check if path exists
+    DWORD attr = GetFileAttributesW(wNormalizedPath);
+    if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+        log_command("ERROR: Path does not exist: %s", path);
+        return;
+    }
+
+    // Convert back to UTF-8 and update current path
+    std::string normalizedPath = WideToUTF8(wNormalizedPath);
+    strcpy(g_currentPath, normalizedPath.c_str());
+    strcpy(g_pathInput, normalizedPath.c_str());
+
+    // Add to history
+    if (g_pathHistoryIndex < (int)g_pathHistory.size() - 1) {
+        // Remove forward history
+        g_pathHistory.erase(g_pathHistory.begin() + g_pathHistoryIndex + 1, g_pathHistory.end());
+    }
+    g_pathHistory.push_back(normalizedPath);
+    g_pathHistoryIndex = g_pathHistory.size() - 1;
+
+    RefreshFileList();
+    log_command("Navigated to: %s", normalizedPath.c_str());
+
+    // Add to MIDI folder history if contains MIDI files
+    AddToMIDIFolderHistory(normalizedPath.c_str());
+}
+
+void NavigateBack() {
+    if (g_pathHistoryIndex > 0) {
+        g_pathHistoryIndex--;
+        strcpy(g_currentPath, g_pathHistory[g_pathHistoryIndex].c_str());
+        strcpy(g_pathInput, g_currentPath);
+        RefreshFileList();
+    }
+}
+
+void NavigateForward() {
+    if (g_pathHistoryIndex < (int)g_pathHistory.size() - 1) {
+        g_pathHistoryIndex++;
+        strcpy(g_currentPath, g_pathHistory[g_pathHistoryIndex].c_str());
+        strcpy(g_pathInput, g_currentPath);
+        RefreshFileList();
+    }
+}
+
+void NavigateToParent() {
+    char parentPath[MAX_PATH];
+    strcpy(parentPath, g_currentPath);
+
+    // Remove trailing backslash if present
+    size_t len = strlen(parentPath);
+    if (len > 0 && parentPath[len - 1] == '\\') {
+        parentPath[len - 1] = '\0';
+        len--;
+    }
+
+    // Find last backslash
+    char* lastSlash = strrchr(parentPath, '\\');
+    if (lastSlash && lastSlash != parentPath) {
+        *lastSlash = '\0';
+        NavigateToPath(parentPath);
+    }
+}
+
+// Split path into segments for Win11-style breadcrumb navigation
+std::vector<std::string> SplitPath(const char* path) {
+    std::vector<std::string> segments;
+    std::string pathStr(path);
+
+    // Handle drive letter (e.g., "C:\")
+    if (pathStr.length() >= 2 && pathStr[1] == ':') {
+        segments.push_back(pathStr.substr(0, 3));  // "C:\"
+        pathStr = pathStr.substr(3);  // Remove drive part
+    }
+
+    // Split remaining path by backslash
+    size_t start = 0;
+    size_t end = 0;
+    while ((end = pathStr.find('\\', start)) != std::string::npos) {
+        if (end > start) {
+            segments.push_back(pathStr.substr(start, end - start));
+        }
+        start = end + 1;
+    }
+
+    // Add last segment if exists
+    if (start < pathStr.length()) {
+        segments.push_back(pathStr.substr(start));
+    }
+
+    return segments;
+}
+
+// ===== MIDI Folder History Management =====
+
+bool ContainsMIDIFiles(const char* folderPath) {
+    WIN32_FIND_DATAW findData;
+    HANDLE findHandle;
+
+    // Convert to wide string
+    std::wstring wPath = UTF8ToWide(folderPath);
+    std::wstring searchPath = wPath + L"\\*.mid";
+
+    findHandle = FindFirstFileW(searchPath.c_str(), &findData);
+    if (findHandle != INVALID_HANDLE_VALUE) {
+        FindClose(findHandle);
+        return true;  // Found at least one .mid file
+    }
+
+    // Try .midi extension
+    searchPath = wPath + L"\\*.midi";
+    findHandle = FindFirstFileW(searchPath.c_str(), &findData);
+    if (findHandle != INVALID_HANDLE_VALUE) {
+        FindClose(findHandle);
+        return true;  // Found at least one .midi file
+    }
+
+    return false;  // No MIDI files found
+}
+
+void AddToMIDIFolderHistory(const char* folderPath) {
+    if (!folderPath || strlen(folderPath) == 0) return;
+    if (!ContainsMIDIFiles(folderPath)) return;  // Only add if contains MIDI files
+
+    // Check if already exists and remove it (so we can add it to the top)
+    for (auto it = g_midiFolderHistory.begin(); it != g_midiFolderHistory.end(); ++it) {
+        if (*it == folderPath) {
+            g_midiFolderHistory.erase(it);
+            break;
+        }
+    }
+
+    // Add to history at the beginning (most recently used at top)
+    g_midiFolderHistory.insert(g_midiFolderHistory.begin(), folderPath);
+
+    // Keep only the most recent 20 entries
+    if (g_midiFolderHistory.size() > 20) {
+        g_midiFolderHistory.pop_back();
+    }
+
+    SaveMIDIFolderHistory();
+}
+
+void SaveMIDIFolderHistory() {
+    char historyPath[MAX_PATH];
+    char exePath[MAX_PATH];
+    GetModuleFileNameA(NULL, exePath, MAX_PATH);
+    char* lastSlash = strrchr(exePath, '\\');
+    if (lastSlash) {
+        *(lastSlash + 1) = '\0';
+    }
+    snprintf(historyPath, MAX_PATH, "%s%s", exePath, g_midiFolderHistoryFile);
+
+    FILE* file = fopen(historyPath, "w");
+    if (file) {
+        for (const auto& path : g_midiFolderHistory) {
+            fprintf(file, "%s\n", path.c_str());
+        }
+        fclose(file);
+    }
+}
+
+void LoadMIDIFolderHistory() {
+    char historyPath[MAX_PATH];
+    char exePath[MAX_PATH];
+    GetModuleFileNameA(NULL, exePath, MAX_PATH);
+    char* lastSlash = strrchr(exePath, '\\');
+    if (lastSlash) {
+        *(lastSlash + 1) = '\0';
+    }
+    snprintf(historyPath, MAX_PATH, "%s%s", exePath, g_midiFolderHistoryFile);
+
+    FILE* file = fopen(historyPath, "r");
+    if (file) {
+        char line[MAX_PATH];
+        while (fgets(line, sizeof(line), file)) {
+            // Remove newline
+            size_t len = strlen(line);
+            if (len > 0 && line[len - 1] == '\n') {
+                line[len - 1] = '\0';
+            }
+
+            // Only add if folder still exists and contains MIDI files
+            if (strlen(line) > 0) {
+                WIN32_FIND_DATAW findData;
+                std::wstring wPath = UTF8ToWide(line);
+                HANDLE findHandle = FindFirstFileW(wPath.c_str(), &findData);
+                if (findHandle != INVALID_HANDLE_VALUE) {
+                    FindClose(findHandle);
+                    if (ContainsMIDIFiles(line)) {
+                        g_midiFolderHistory.push_back(line);
+                    }
+                }
+            }
+        }
+        fclose(file);
+    }
+}
+
+void ClearMIDIFolderHistory() {
+    g_midiFolderHistory.clear();
+    SaveMIDIFolderHistory();
+}
+
+void RemoveMIDIFolderHistoryEntry(int index) {
+    if (index >= 0 && index < (int)g_midiFolderHistory.size()) {
+        g_midiFolderHistory.erase(g_midiFolderHistory.begin() + index);
+        SaveMIDIFolderHistory();
+    }
+}
+
+void InitializeFileBrowser() {
+    // Load MIDI folder history
+    LoadMIDIFolderHistory();
+
+    // Get exe directory as default path using wide character API
+    wchar_t wExePath[MAX_PATH];
+    GetModuleFileNameW(NULL, wExePath, MAX_PATH);
+    wchar_t* lastSlash = wcsrchr(wExePath, L'\\');
+    if (lastSlash) {
+        *lastSlash = L'\0';
+    }
+
+    std::string exePath = WideToUTF8(wExePath);
+    NavigateToPath(exePath.c_str());
+}
+
+// ===== Global Media Keys Support =====
+
+void RegisterGlobalMediaKeys() {
+    if (!g_mainWindow) return;
+
+    // Register hotkeys for media control
+    // MOD_NOREPEAT prevents key repeat
+    bool success = true;
+
+    if (!RegisterHotKey(g_mainWindow, HK_PLAY_PAUSE, MOD_NOREPEAT, VK_MEDIA_PLAY_PAUSE)) {
+        log_command("Warning: Failed to register Play/Pause media key");
+        success = false;
+    }
+
+    if (!RegisterHotKey(g_mainWindow, HK_NEXT_TRACK, MOD_NOREPEAT, VK_MEDIA_NEXT_TRACK)) {
+        log_command("Warning: Failed to register Next Track media key");
+        success = false;
+    }
+
+    if (!RegisterHotKey(g_mainWindow, HK_PREV_TRACK, MOD_NOREPEAT, VK_MEDIA_PREV_TRACK)) {
+        log_command("Warning: Failed to register Previous Track media key");
+        success = false;
+    }
+
+    if (success) {
+        log_command("Global media keys registered successfully");
+    }
+}
+
+void UnregisterGlobalMediaKeys() {
+    if (!g_mainWindow) return;
+
+    UnregisterHotKey(g_mainWindow, HK_PLAY_PAUSE);
+    UnregisterHotKey(g_mainWindow, HK_NEXT_TRACK);
+    UnregisterHotKey(g_mainWindow, HK_PREV_TRACK);
+
+    log_command("Global media keys unregistered");
+}
+
+// ===== Auto-Skip Silence Function =====
+
+// Find the first note-on event (excluding drum channel)
+// Returns the event index, and sets the tick value via parameter
+int FindFirstNoteEvent(int& outTick) {
+    outTick = 0;
+    if (g_midiPlayer.currentFileName.empty()) return 0;
+    if (g_midiPlayer.midiFile.getEventCount(0) == 0) return 0;
+
+    MidiEventList& track = g_midiPlayer.midiFile[0];
+
+    for (int i = 0; i < (int)track.size(); i++) {
+        MidiEvent& event = track[i];
+
+        // Look for note-on events (not drum channel)
+        if (event.isNoteOn() && event.getVelocity() > 0) {
+            int channel = event.getChannel();
+            // Skip drum channel (MIDI channel 10 = index 9)
+            if (channel != 9) {
+                outTick = event.tick;
+                log_command("First note found at event index: %d, tick: %d", i, event.tick);
+                return i;  // Return event index
+            }
+        }
+    }
+
+    // No note-on event found
+    return 0;
+}
+
+// Calculate total MIDI duration in microseconds
+double GetMIDITotalDuration() {
+    if (g_midiPlayer.currentFileName.empty()) return 0.0;
+    if (g_midiPlayer.midiFile.getEventCount(0) == 0) return 0.0;
+
+    MidiEventList& track = g_midiPlayer.midiFile[0];
+    if (track.size() == 0) return 0.0;
+
+    // Get the last event's tick
+    int lastTick = track[track.size() - 1].tick;
+
+    // Convert MIDI tick to microseconds
+    double microsPerTick = g_midiPlayer.tempo / (double)g_midiPlayer.ticksPerQuarterNote;
+    return (double)lastTick * microsPerTick;
+}
+
+// Format time in microseconds to MM:SS format
+std::string FormatTime(double microseconds) {
+    int totalSeconds = (int)(microseconds / 1000000.0);
+    int minutes = totalSeconds / 60;
+    int seconds = totalSeconds % 60;
+
+    char buffer[16];
+    snprintf(buffer, sizeof(buffer), "%d:%02d", minutes, seconds);
+    return std::string(buffer);
+}
+
+// ===== MIDI Player Functions =====
+
+bool LoadMIDIFile(const char* filename) {
+    g_midiPlayer.midiFile.clear();
+
+    // Convert UTF-8 path to wide string for Unicode support
+    std::wstring wFilename = UTF8ToWide(filename);
+
+#ifdef _WIN32
+    // Use wide string version for proper Unicode path support on Windows
+    if (!g_midiPlayer.midiFile.read(wFilename)) {
+        log_command("ERROR: Failed to load MIDI file: %s", filename);
+        return false;
+    }
+#else
+    // On non-Windows platforms, use standard read method
+    if (!g_midiPlayer.midiFile.read(filename)) {
+        log_command("ERROR: Failed to load MIDI file: %s", filename);
+        return false;
+    }
+#endif
+
+    g_midiPlayer.currentFileName = filename;
+    g_midiPlayer.currentTick = 0;
+    g_midiPlayer.isPlaying = false;
+    g_midiPlayer.isPaused = false;
+    g_midiPlayer.ticksPerQuarterNote = g_midiPlayer.midiFile.getTicksPerQuarterNote();
+    g_midiPlayer.tempo = 500000.0;  // Default tempo
+    g_midiPlayer.activeNotes.clear();
+
+    // Reset sustain pedal state when loading new file
+    g_sustainPedalActive = false;
+
+    // Make sure ticks are absolute
+    g_midiPlayer.midiFile.makeAbsoluteTicks();
+    g_midiPlayer.midiFile.joinTracks();  // Merge all tracks for easier playback
+
+    int numEvents = g_midiPlayer.midiFile.getEventCount(0);
+    log_command("=== MIDI File Loaded ===");
+    log_command("File: %s", filename);
+    log_command("Events: %d", numEvents);
+    log_command("TPQ: %d", g_midiPlayer.ticksPerQuarterNote);
+
+    // Analyze velocity distribution for dynamic mapping
+    if (g_enableDynamicVelocityMapping) {
+        AnalyzeVelocityDistribution();
+    }
+
+    return true;
+}
+
+// ===== Playlist Navigation Functions =====
+
+int GetNextMIDIFileIndex() {
+    // Build list of MIDI file indices
+    std::vector<int> midiIndices;
+    for (int i = 0; i < (int)g_fileList.size(); i++) {
+        if (!g_fileList[i].isDirectory && !g_fileList[i].fullPath.empty()) {
+            midiIndices.push_back(i);
+        }
+    }
+
+    if (midiIndices.empty()) return -1;
+
+    if (g_isSequentialPlayback) {
+        // Sequential: find next MIDI file after current
+        if (g_currentPlayingIndex < 0) {
+            return midiIndices[0];  // Start from first
+        }
+
+        // Find current index in MIDI list
+        auto it = std::find(midiIndices.begin(), midiIndices.end(), g_currentPlayingIndex);
+        if (it != midiIndices.end()) {
+            // Move to next, wrap around if at end
+            it++;
+            if (it == midiIndices.end()) {
+                return midiIndices[0];  // Loop to first
+            }
+            return *it;
+        }
+
+        return midiIndices[0];  // Fallback to first
+    } else {
+        // Random: pick a random MIDI file (excluding current)
+        static std::random_device rd;
+        static std::mt19937 gen(rd());
+
+        if (midiIndices.size() == 1) {
+            return midiIndices[0];  // Only one file
+        }
+
+        // Exclude current playing file from random selection
+        std::vector<int> candidates;
+        for (int idx : midiIndices) {
+            if (idx != g_currentPlayingIndex) {
+                candidates.push_back(idx);
+            }
+        }
+
+        if (candidates.empty()) {
+            return midiIndices[0];
+        }
+
+        std::uniform_int_distribution<> dis(0, candidates.size() - 1);
+        return candidates[dis(gen)];
+    }
+}
+
+int GetPreviousMIDIFileIndex() {
+    // Build list of MIDI file indices
+    std::vector<int> midiIndices;
+    for (int i = 0; i < (int)g_fileList.size(); i++) {
+        if (!g_fileList[i].isDirectory && !g_fileList[i].fullPath.empty()) {
+            midiIndices.push_back(i);
+        }
+    }
+
+    if (midiIndices.empty()) return -1;
+
+    if (g_isSequentialPlayback) {
+        // Sequential: find previous MIDI file
+        if (g_currentPlayingIndex < 0) {
+            return midiIndices.empty() ? -1 : midiIndices.back();  // Start from last
+        }
+
+        // Find current index in MIDI list
+        auto it = std::find(midiIndices.begin(), midiIndices.end(), g_currentPlayingIndex);
+        if (it != midiIndices.end()) {
+            // Move to previous, wrap around if at beginning
+            if (it == midiIndices.begin()) {
+                return midiIndices.back();  // Loop to last
+            }
+            it--;
+            return *it;
+        }
+
+        return midiIndices.back();  // Fallback to last
+    } else {
+        // Random mode: same as next (pick random)
+        return GetNextMIDIFileIndex();
+    }
+}
+
+void PlayNextMIDI() {
+    int nextIndex = GetNextMIDIFileIndex();
+    if (nextIndex >= 0 && nextIndex < (int)g_fileList.size()) {
+        g_currentPlayingIndex = nextIndex;
+        g_selectedFileIndex = nextIndex;
+
+        // Reset YM2163 chips to eliminate residual sound
+        ResetAllYM2163Chips();
+
+        // Initialize all channels to eliminate residual sound
+        InitializeAllChannels();
+        stop_all_notes();
+        g_midiPlayer.activeNotes.clear();
+
+        if (LoadMIDIFile(g_fileList[nextIndex].fullPath.c_str())) {
+            // Ensure progress bar is reset to 0
+            g_midiPlayer.currentTick = 0;
+            g_midiPlayer.pausedDuration = std::chrono::milliseconds(0);
+            PlayMIDI();
+        }
+    }
+}
+
+void PlayPreviousMIDI() {
+    int prevIndex = GetPreviousMIDIFileIndex();
+    if (prevIndex >= 0 && prevIndex < (int)g_fileList.size()) {
+        g_currentPlayingIndex = prevIndex;
+        g_selectedFileIndex = prevIndex;
+
+        // Reset YM2163 chips to eliminate residual sound
+        ResetAllYM2163Chips();
+
+        // Initialize all channels to eliminate residual sound
+        InitializeAllChannels();
+        stop_all_notes();
+        g_midiPlayer.activeNotes.clear();
+
+        if (LoadMIDIFile(g_fileList[prevIndex].fullPath.c_str())) {
+            // Ensure progress bar is reset to 0
+            g_midiPlayer.currentTick = 0;
+            g_midiPlayer.pausedDuration = std::chrono::milliseconds(0);
+            PlayMIDI();
+        }
+    }
+}
+
+void PlayMIDI() {
+    if (g_midiPlayer.currentFileName.empty()) return;
+
+    if (g_midiPlayer.isPaused) {
+        // Resume from pause
+        g_midiPlayer.isPaused = false;
+        auto now = std::chrono::steady_clock::now();
+        g_midiPlayer.pausedDuration += std::chrono::duration_cast<std::chrono::milliseconds>(now - g_midiPlayer.pauseTime);
+        log_command("MIDI playback resumed");
+    } else {
+        // Start from beginning
+        g_midiPlayer.currentTick = 0;
+        g_midiPlayer.isPlaying = true;
+        g_midiPlayer.playStartTime = std::chrono::steady_clock::now();
+        g_midiPlayer.pausedDuration = std::chrono::milliseconds(0);
+        stop_all_notes();
+        g_midiPlayer.activeNotes.clear();
+        // Reset sustain pedal state when starting new playback
+        g_sustainPedalActive = false;
+
+        // Auto-skip silence at the beginning if enabled
+        if (g_enableAutoSkipSilence) {
+            int firstNoteTick = 0;
+            int firstNoteIndex = FindFirstNoteEvent(firstNoteTick);
+
+            // If there's silence before the first note (firstNoteIndex > 0), skip it
+            if (firstNoteIndex > 0) {
+                // Pre-process all control events before the first note
+                // This ensures tempo and other control changes are applied correctly
+                MidiEventList& track = g_midiPlayer.midiFile[0];
+
+                for (int i = 0; i < firstNoteIndex; i++) {
+                    MidiEvent& event = track[i];
+
+                    // Process control events (tempo, program change, etc.)
+                    if (event.isTempo()) {
+                        g_midiPlayer.tempo = event.getTempoMicroseconds();
+                    } else if (event.isController()) {
+                        int controller = event[1];
+                        int value = event[2];
+                        if (controller == 64 && g_enableSustainPedal) {
+                            g_sustainPedalActive = (value >= 64);
+                        }
+                    }
+                    // Skip note events - we don't want to play them
+                }
+
+                // Set the current tick to first note INDEX (not tick value)
+                g_midiPlayer.currentTick = firstNoteIndex;
+
+                // Set accumulated time to match the first note's MIDI tick
+                // This ensures the timing is correct when UpdateMIDIPlayback starts
+                double microsPerTick = g_midiPlayer.tempo / (double)g_midiPlayer.ticksPerQuarterNote;
+                g_midiPlayer.accumulatedTime = (double)firstNoteTick * microsPerTick;
+
+                log_command("Auto-skipped to event %d (MIDI tick: %d, time: %.2f ms)",
+                           firstNoteIndex, firstNoteTick, g_midiPlayer.accumulatedTime / 1000.0);
+            } else {
+                // No silence to skip, start from beginning
+                g_midiPlayer.accumulatedTime = 0.0;
+            }
+        } else {
+            // Auto-skip disabled, start from beginning
+            g_midiPlayer.accumulatedTime = 0.0;
+        }
+
+        // Initialize performance counter
+        QueryPerformanceCounter(&g_midiPlayer.lastPerfCounter);
+        QueryPerformanceFrequency(&g_midiPlayer.perfCounterFreq);
+
+        log_command("MIDI playback started");
+    }
+
+    g_midiPlayer.isPlaying = true;
+}
+
+void PauseMIDI() {
+    if (!g_midiPlayer.isPlaying || g_midiPlayer.isPaused) return;
+
+    g_midiPlayer.isPaused = true;
+    g_midiPlayer.pauseTime = std::chrono::steady_clock::now();
+    stop_all_notes();
+    log_command("MIDI playback paused");
+}
+
+void StopMIDI() {
+    g_midiPlayer.isPlaying = false;
+    g_midiPlayer.isPaused = false;
+    g_midiPlayer.currentTick = 0;
+    stop_all_notes();
+    g_midiPlayer.activeNotes.clear();
+    // Reset sustain pedal state when stopping playback
+    g_sustainPedalActive = false;
+    log_command("MIDI playback stopped");
+}
+
+// Rebuild active notes state after seeking
+void RebuildActiveNotesAfterSeek(int targetTick) {
+    if (g_midiPlayer.currentFileName.empty()) return;
+    if (g_midiPlayer.midiFile.getEventCount(0) == 0) return;
+
+    // Track which notes are on at the target tick by scanning backwards
+    std::map<int, std::map<int, bool>> notesOn;  // channel -> note -> isOn
+
+    MidiEventList& track = g_midiPlayer.midiFile[0];
+
+    // Scan all events up to targetTick to find which notes should be playing
+    for (int i = 0; i < track.size() && i < targetTick; i++) {
+        MidiEvent& event = track[i];
+
+        if (event.isNoteOn()) {
+            int channel = event.getChannel();
+            int note = event.getKeyNumber();
+            int velocity = event.getVelocity();
+
+            if (channel == 9) continue;  // Skip drum channel
+
+            if (velocity > 0) {
+                notesOn[channel][note] = true;
+            } else {
+                notesOn[channel][note] = false;
+            }
+        } else if (event.isNoteOff()) {
+            int channel = event.getChannel();
+            int note = event.getKeyNumber();
+            notesOn[channel][note] = false;
+        }
+    }
+
+    // Now replay all notes that should be active at this point
+    for (auto& channelPair : notesOn) {
+        int channel = channelPair.first;
+        for (auto& notePair : channelPair.second) {
+            int note = notePair.first;
+            bool isOn = notePair.second;
+
+            if (isOn) {
+                // This note should be playing - start it
+                int ymChannel = find_free_channel();
+                if (ymChannel >= 0) {
+                    // Map MIDI note to YM2163 note/octave
+                    int ymNote = note % 12;
+                    int ymOctave = (note / 12) - 2;
+
+                    // Auto-adjust octave if out of range
+                    while (ymOctave < 0 || (ymOctave == 0 && ymNote < 11)) {
+                        ymOctave++;
+                    }
+                    while (ymOctave > 5 || (ymOctave == 5 && ymNote > 11)) {
+                        ymOctave--;
+                    }
+
+                    // Choose instrument settings based on mode
+                    int useWave, useEnvelope, useVolume;
+                    if (g_useLiveControl) {
+                        useWave = g_currentTimbre;
+                        useEnvelope = g_currentEnvelope;
+                        useVolume = g_currentVolume;
+                    } else {
+                        int program = 0;
+                        if (g_instrumentConfigs.count(program) > 0) {
+                            InstrumentConfig& config = g_instrumentConfigs[program];
+                            useWave = config.wave;
+                            useEnvelope = config.envelope;
+                        } else {
+                            useWave = 4;
+                            useEnvelope = 0;
+                        }
+                        useVolume = g_currentVolume;
+                    }
+
+                    // Use default velocity for seek (no velocity mapping)
+                    int defaultVelocity = 96;  // Default velocity for seek
+                    if (g_enableVelocityMapping) {
+                        useVolume = map_velocity_to_volume(defaultVelocity);
+                    }
+
+                    g_channels[ymChannel].midiChannel = channel;
+                    play_note(ymChannel, ymNote, ymOctave, useWave, useEnvelope, useVolume);
+
+                    // Update piano key visual with velocity info
+                    int keyIdx = get_key_index(ymOctave, ymNote);
+                    if (keyIdx >= 0 && keyIdx < 61) {
+                        g_pianoKeyPressed[keyIdx] = true;
+                        g_pianoKeyVelocity[keyIdx] = defaultVelocity;  // Store default velocity for seek
+                    }
+
+                    g_midiPlayer.activeNotes[channel][note] = ymChannel;
+                }
+            }
+        }
+    }
+}
+
+void UpdateMIDIPlayback() {
+    if (!g_midiPlayer.isPlaying || g_midiPlayer.isPaused) return;
+    if (g_midiPlayer.currentFileName.empty()) return;
+
+    // High-precision timer (yasp-style optimization)
+    // Use QueryPerformanceCounter for more accurate timing than chrono
+    LARGE_INTEGER currentCounter;
+    QueryPerformanceCounter(&currentCounter);
+
+    double deltaTime = (double)(currentCounter.QuadPart - g_midiPlayer.lastPerfCounter.QuadPart) /
+                       (double)g_midiPlayer.perfCounterFreq.QuadPart * 1000000.0;  // Convert to microseconds
+    g_midiPlayer.lastPerfCounter = currentCounter;
+
+    // Accumulate time for precise tick calculation
+    g_midiPlayer.accumulatedTime += deltaTime;
+
+    // Calculate current tick based on accumulated time
+    double ticksPerMicrosecond = (double)g_midiPlayer.ticksPerQuarterNote / g_midiPlayer.tempo;
+    int targetTick = (int)(g_midiPlayer.accumulatedTime * ticksPerMicrosecond);
+
+    // Process all events up to current tick
+    MidiEventList& track = g_midiPlayer.midiFile[0];
+
+    while (g_midiPlayer.currentTick < track.size()) {
+        MidiEvent& event = track[g_midiPlayer.currentTick];
+
+        if (event.tick > targetTick) {
+            break;  // Haven't reached this event yet
+        }
+
+        // Process this event
+        if (event.isNoteOn()) {
+            int channel = event.getChannel();
+            int note = event.getKeyNumber();
+            int velocity = event.getVelocity();
+
+            if (velocity > 0) {
+                // Check if this is a drum channel (MIDI channel 10 = index 9)
+                if (channel == 9) {
+                    // Drum event - map MIDI drum note to YM2163 drum
+                    if (g_drumConfigs.count(note) > 0) {
+                        DrumConfig& drumConfig = g_drumConfigs[note];
+                        // Trigger all mapped drums
+                        uint8_t drumBits = 0;
+                        for (uint8_t bit : drumConfig.drumBits) {
+                            drumBits |= bit;
+                        }
+                        play_drum(drumBits);
+                    }
+                } else {
+                    // Note on - melody channel
+                    int ymChannel = find_free_channel();
+                    if (ymChannel >= 0) {
+                    // Map MIDI note to YM2163 note/octave (降低一个八度)
+                    int ymNote = note % 12;
+                    int ymOctave = (note / 12) - 2;  // MIDI octave starts at C-1, 降低一个八度
+
+                    // Auto-adjust octave if out of range (B2-B7)
+                    while (ymOctave < 0 || (ymOctave == 0 && ymNote < 11)) {
+                        ymOctave++;  // Move up one octave
+                    }
+                    while (ymOctave > 5 || (ymOctave == 5 && ymNote > 11)) {
+                        ymOctave--;  // Move down one octave
+                    }
+
+                    // Choose instrument settings based on mode
+                    int useWave, useEnvelope, useVolume;
+                    if (g_useLiveControl) {
+                        // Live Control Mode: use UI settings
+                        useWave = g_currentTimbre;
+                        useEnvelope = g_currentEnvelope;
+                        useVolume = g_currentVolume;
+                    } else {
+                        // Config Mode: use instrument config from MIDI program
+                        int program = 0;  // TODO: Track program changes per channel
+                        if (g_instrumentConfigs.count(program) > 0) {
+                            InstrumentConfig& config = g_instrumentConfigs[program];
+                            useWave = config.wave;
+                            useEnvelope = config.envelope;
+                        } else {
+                            // Fallback to default (Piano with Decay)
+                            useWave = 4;
+                            useEnvelope = 0;
+                        }
+                        useVolume = g_currentVolume;
+                    }
+
+                    // Map velocity to volume if enabled
+                    if (g_enableVelocityMapping) {
+                        useVolume = map_velocity_to_volume(velocity);
+                    }
+
+                    // Map sustain pedal to envelope if enabled
+                    if (g_enableSustainPedal) {
+                        if (g_sustainPedalActive) {
+                            useEnvelope = 1;  // Fast envelope when pedal is down
+                        } else {
+                            useEnvelope = 0;  // Decay envelope when pedal is up
+                        }
+                    }
+
+                    g_channels[ymChannel].midiChannel = channel;
+                    play_note(ymChannel, ymNote, ymOctave, useWave, useEnvelope, useVolume);
+
+                    // Update piano key visual with velocity info
+                    int keyIdx = get_key_index(ymOctave, ymNote);
+                    if (keyIdx >= 0 && keyIdx < 61) {
+                        g_pianoKeyPressed[keyIdx] = true;
+                        g_pianoKeyVelocity[keyIdx] = velocity;  // Store velocity
+                        g_pianoKeyFromKeyboard[keyIdx] = false;  // MIDI source, not keyboard
+                    }
+
+                    g_midiPlayer.activeNotes[channel][note] = ymChannel;
+                }
+                }  // End of melody channel handling
+            } else {
+                // Note off (velocity 0)
+                if (g_midiPlayer.activeNotes[channel].count(note) > 0) {
+                    int ymChannel = g_midiPlayer.activeNotes[channel][note];
+
+                    // Clear piano key visual
+                    if (g_channels[ymChannel].active) {
+                        int keyIdx = get_key_index(g_channels[ymChannel].octave, g_channels[ymChannel].note);
+                        if (keyIdx >= 0 && keyIdx < 61) {
+                            g_pianoKeyPressed[keyIdx] = false;
+                            g_pianoKeyVelocity[keyIdx] = 0;  // Clear velocity
+                        }
+                    }
+
+                    stop_note(ymChannel);
+                    g_midiPlayer.activeNotes[channel].erase(note);
+                }
+            }
+        } else if (event.isNoteOff()) {
+            int channel = event.getChannel();
+            int note = event.getKeyNumber();
+
+            if (g_midiPlayer.activeNotes[channel].count(note) > 0) {
+                int ymChannel = g_midiPlayer.activeNotes[channel][note];
+
+                // Clear piano key visual
+                if (g_channels[ymChannel].active) {
+                    int keyIdx = get_key_index(g_channels[ymChannel].octave, g_channels[ymChannel].note);
+                    if (keyIdx >= 0 && keyIdx < 61) {
+                        g_pianoKeyPressed[keyIdx] = false;
+                    }
+                }
+
+                stop_note(ymChannel);
+                g_midiPlayer.activeNotes[channel].erase(note);
+            }
+        } else if (event.isTempo()) {
+            // Get tempo in microseconds per quarter note
+            g_midiPlayer.tempo = event.getTempoMicroseconds();
+            // Recalculate accumulated time based on current tick
+            g_midiPlayer.accumulatedTime = (double)g_midiPlayer.currentTick * g_midiPlayer.tempo / g_midiPlayer.ticksPerQuarterNote;
+        } else if (event.isController()) {
+            // Handle MIDI Control Change messages
+            int controller = event[1];
+            int value = event[2];
+
+            // CC64: Sustain Pedal
+            if (controller == 64 && g_enableSustainPedal) {
+                g_sustainPedalActive = (value >= 64);
+            }
+        }
+
+        g_midiPlayer.currentTick++;
+    }
+
+    // Check if playback finished
+    if (g_midiPlayer.currentTick >= track.size()) {
+        StopMIDI();
+        log_command("MIDI playback finished");
+
+        // Auto-play next track if enabled
+        if (g_autoPlayNext) {
+            PlayNextMIDI();
+        }
+    }
+}
+
+// ===== Keyboard Mapping =====
+
+typedef struct {
+    int vk;
+    int note;
+    int octave_offset;
+} KeyMapping;
+
+static KeyMapping g_keyMappings[] = {
+    {'Z', 0, 0}, {'X', 2, 0}, {'C', 4, 0}, {'V', 5, 0}, {'B', 7, 0}, {'N', 9, 0}, {'M', 11, 0},
+    {VK_OEM_COMMA, 0, 1}, {VK_OEM_PERIOD, 2, 1}, {VK_OEM_2, 4, 1},
+    {'S', 1, 0}, {'D', 3, 0}, {'G', 6, 0}, {'H', 8, 0}, {'J', 10, 0}, {'K', 1, 1}, {'L', 3, 1},
+    {'Q', 0, 1}, {'W', 2, 1}, {'E', 4, 1}, {'R', 5, 1}, {'T', 7, 1}, {'Y', 9, 1}, {'U', 11, 1},
+    {'I', 0, 2}, {'O', 2, 2}, {'P', 4, 2}, {VK_OEM_4, 5, 2}, {VK_OEM_6, 7, 2},
+    {'2', 1, 1}, {'3', 3, 1}, {'5', 6, 1}, {'6', 8, 1}, {'7', 10, 1}, {'8', 1, 2}, {'9', 3, 2}, {'0', 6, 2},
+};
+
+static const int g_numKeyMappings = sizeof(g_keyMappings) / sizeof(KeyMapping);
+
+// ===== ImGui UI Functions =====
+
+void RenderMIDIPlayer() {
+    ImGui::Text("MIDI Player");
+    ImGui::Separator();
+
+    // Playback controls (at top)
+    float buttonWidth = (ImGui::GetContentRegionAvail().x - 10.0f) / 3.0f;
+    if (ImGui::Button("Play", ImVec2(buttonWidth, 30))) {
+        PlayMIDI();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Pause", ImVec2(buttonWidth, 30))) {
+        PauseMIDI();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Stop", ImVec2(buttonWidth, 30))) {
+        StopMIDI();
+    }
+
+    // Playlist navigation
+    float navButtonWidth = (ImGui::GetContentRegionAvail().x - 10.0f) / 2.0f;
+    if (ImGui::Button("<< Prev", ImVec2(navButtonWidth, 25))) {
+        PlayPreviousMIDI();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Next >>", ImVec2(navButtonWidth, 25))) {
+        PlayNextMIDI();
+    }
+
+    // Playback mode and options
+    ImGui::Checkbox("Auto-play next", &g_autoPlayNext);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Automatically play next track when current finishes");
+    }
+
+    ImGui::SameLine();
+
+    const char* modeText = g_isSequentialPlayback ? "Sequential" : "Random";
+    if (ImGui::Button(modeText, ImVec2(85, 0))) {
+        g_isSequentialPlayback = !g_isSequentialPlayback;
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Click to toggle: Sequential (loop) / Random");
+    }
+
+    ImGui::Spacing();
+
+    // Status and current file
+    if (g_midiPlayer.isPlaying && !g_midiPlayer.isPaused) {
+        ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "Playing:");
+    } else if (g_midiPlayer.isPaused) {
+        ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "Paused:");
+    } else {
+        ImGui::Text("Ready:");
+    }
+
+    ImGui::SameLine();
+
+    if (!g_midiPlayer.currentFileName.empty()) {
+        const char* filename = strrchr(g_midiPlayer.currentFileName.c_str(), '\\');
+        if (!filename) filename = strrchr(g_midiPlayer.currentFileName.c_str(), '/');
+        if (!filename) filename = g_midiPlayer.currentFileName.c_str();
+        else filename++;
+        ImGui::Text("%s", filename);
+    } else {
+        ImGui::TextDisabled("No file loaded");
+    }
+
+    // Progress bar with time display (clickable)
+    if (!g_midiPlayer.currentFileName.empty() && g_midiPlayer.midiFile.getEventCount(0) > 0) {
+        // Calculate current time and total duration based on MIDI ticks
+        MidiEventList& track = g_midiPlayer.midiFile[0];
+
+        // Get current MIDI tick
+        int currentMidiTick = 0;
+        if (g_midiPlayer.currentTick < track.size()) {
+            currentMidiTick = track[g_midiPlayer.currentTick].tick;
+        }
+
+        // Get last MIDI tick (total duration)
+        int lastMidiTick = 0;
+        if (track.size() > 0) {
+            lastMidiTick = track[track.size() - 1].tick;
+        }
+
+        // Convert MIDI ticks to microseconds
+        double microsPerTick = g_midiPlayer.tempo / (double)g_midiPlayer.ticksPerQuarterNote;
+        double currentTimeMicros = (double)currentMidiTick * microsPerTick;
+        double totalTimeMicros = (double)lastMidiTick * microsPerTick;
+
+        // Calculate progress based on time, not event count
+        float progress = (totalTimeMicros > 0) ? (float)(currentTimeMicros / totalTimeMicros) : 0.0f;
+        progress = (progress < 0.0f) ? 0.0f : (progress > 1.0f ? 1.0f : progress);
+
+        // Format time strings
+        std::string currentTimeStr = FormatTime(currentTimeMicros);
+        std::string totalTimeStr = FormatTime(totalTimeMicros);
+
+        // Display time information above progress bar
+        ImGui::Text("%s / %s", currentTimeStr.c_str(), totalTimeStr.c_str());
+
+        ImVec2 progressPos = ImGui::GetCursorScreenPos();
+        ImVec2 progressSize = ImVec2(ImGui::GetContentRegionAvail().x, 20);
+
+        ImGui::ProgressBar(progress, progressSize, "");
+
+        // Handle progress bar click to seek
+        if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(0)) {
+            ImVec2 mousePos = ImGui::GetMousePos();
+            float clickPos = (mousePos.x - progressPos.x) / progressSize.x;
+            clickPos = clickPos < 0.0f ? 0.0f : (clickPos > 1.0f ? 1.0f : clickPos);
+
+            // Calculate target MIDI tick based on time
+            int targetMidiTick = (int)(clickPos * lastMidiTick);
+
+            // Find the event index that corresponds to this MIDI tick
+            int targetEventIndex = 0;
+            for (int i = 0; i < (int)track.size(); i++) {
+                if (track[i].tick >= targetMidiTick) {
+                    targetEventIndex = i;
+                    break;
+                }
+            }
+
+            g_midiPlayer.currentTick = targetEventIndex;
+
+            // Remember if we were playing before seek
+            bool wasPlaying = g_midiPlayer.isPlaying && !g_midiPlayer.isPaused;
+
+            // Recalculate timing based on actual MIDI tick value
+            auto now = std::chrono::steady_clock::now();
+            if (wasPlaying) {
+                // If playing, adjust playStartTime to maintain playing state
+                g_midiPlayer.playStartTime = now - std::chrono::microseconds((int)(targetMidiTick * microsPerTick));
+                g_midiPlayer.pausedDuration = std::chrono::milliseconds(0);
+            } else if (g_midiPlayer.isPaused) {
+                // If paused, update pauseTime to new position
+                g_midiPlayer.playStartTime = now - std::chrono::microseconds((int)(targetMidiTick * microsPerTick));
+                g_midiPlayer.pauseTime = now;
+                g_midiPlayer.pausedDuration = std::chrono::milliseconds(0);
+            }
+
+            // Stop all currently playing notes
+            stop_all_notes();
+            g_midiPlayer.activeNotes.clear();
+
+            log_command("Seek to progress: %.1f%% (time: %s)", clickPos * 100.0f, currentTimeStr.c_str());
+        }
+    } else {
+        ImGui::ProgressBar(0.0f, ImVec2(-1, 20), "");
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Text("File Browser");
+    ImGui::Separator();
+
+    // Navigation bar
+    if (ImGui::Button("<", ImVec2(25, 0))) {
+        NavigateBack();
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Back");
+
+    ImGui::SameLine();
+
+    if (ImGui::Button(">", ImVec2(25, 0))) {
+        NavigateForward();
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Forward");
+
+    ImGui::SameLine();
+
+    // Up arrow button (navigate to parent directory)
+    if (ImGui::Button("^", ImVec2(25, 0))) {
+        NavigateToParent();
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Up to parent directory");
+
+    ImGui::SameLine();
+
+    // Win11-style address bar: breadcrumb buttons or text input
+    if (!g_pathEditMode) {
+        // Breadcrumb mode: show path segments as clickable buttons
+        // Priority: show rightmost (current) directory, truncate left with "..." if needed
+
+        float availWidth = ImGui::GetContentRegionAvail().x;
+        std::vector<std::string> segments = SplitPath(g_currentPath);
+
+        // Calculate button widths more accurately
+        std::vector<float> buttonWidths;
+        std::vector<std::string> accumulatedPaths;
+        std::string accumulatedPath;
+
+        // Get style parameters for accurate width calculation
+        ImGuiStyle& style = ImGui::GetStyle();
+        float framePaddingX = style.FramePadding.x;
+        float itemSpacingX = style.ItemSpacing.x;
+        float buttonBorderSize = style.FrameBorderSize;
+
+        for (size_t i = 0; i < segments.size(); i++) {
+            // Build accumulated path for this segment
+            if (i == 0) {
+                accumulatedPath = segments[i];
+            } else {
+                if (accumulatedPath.back() != '\\') {
+                    accumulatedPath += "\\";
+                }
+                accumulatedPath += segments[i];
+            }
+            accumulatedPaths.push_back(accumulatedPath);
+
+            // Calculate button width accurately:
+            // text width + left padding + right padding + border + extra safety margin
+            ImVec2 textSize = ImGui::CalcTextSize(segments[i].c_str());
+            float buttonWidth = textSize.x + framePaddingX * 2.0f + buttonBorderSize * 2.0f + 4.0f;  // +4 for safety
+            buttonWidths.push_back(buttonWidth);
+        }
+
+        // Calculate separator width (includes spacing on both sides)
+        ImVec2 separatorTextSize = ImGui::CalcTextSize(">");
+        float separatorWidth = separatorTextSize.x + itemSpacingX * 2.0f;
+
+        // Calculate ellipsis button width
+        ImVec2 ellipsisTextSize = ImGui::CalcTextSize("...");
+        float ellipsisButtonWidth = ellipsisTextSize.x + framePaddingX * 2.0f + buttonBorderSize * 2.0f + 4.0f;
+        float ellipsisWidth = ellipsisButtonWidth + separatorWidth;
+
+        // Reserve some safety margin from available width to prevent overflow
+        float safeAvailWidth = availWidth - 10.0f;  // Reserve 10px safety margin
+
+        // Determine which segments to show (from right to left)
+        // Priority: always show the rightmost (current) directory
+        int firstVisibleSegment = 0;
+
+        if (segments.empty()) {
+            firstVisibleSegment = 0;
+        } else {
+            // Start with the last segment (always visible)
+            float usedWidth = buttonWidths[segments.size() - 1];
+            firstVisibleSegment = segments.size() - 1;
+
+            // Try to add more segments from right to left
+            for (int i = segments.size() - 2; i >= 0; i--) {
+                float segmentWidth = buttonWidths[i] + separatorWidth;
+
+                // Check if we need ellipsis
+                if (i > 0 && usedWidth + segmentWidth > safeAvailWidth) {
+                    // Need to truncate, check if we have space for ellipsis
+                    if (usedWidth + ellipsisWidth <= safeAvailWidth) {
+                        // Can show ellipsis, current firstVisibleSegment is correct
+                        break;
+                    } else {
+                        // Not enough space even for ellipsis, keep current firstVisibleSegment
+                        break;
+                    }
+                } else if (i == 0 && usedWidth + segmentWidth > safeAvailWidth) {
+                    // First segment doesn't fit, will show ellipsis
+                    break;
+                } else {
+                    // This segment fits, include it
+                    usedWidth += segmentWidth;
+                    firstVisibleSegment = i;
+                }
+            }
+        }
+
+        // Create an invisible button covering the entire address bar area for click detection
+        ImVec2 barStartPos = ImGui::GetCursorScreenPos();
+        float barHeight = ImGui::GetFrameHeight();
+
+        // Render breadcrumb bar
+        ImGui::BeginGroup();
+
+        // Show ellipsis if we're truncating
+        if (firstVisibleSegment > 0) {
+            if (ImGui::Button("...##ellipsis")) {
+                // Click on ellipsis shows the full path in edit mode
+                g_pathEditMode = true;
+                g_pathEditModeJustActivated = true;
+                strcpy(g_pathInput, g_currentPath);
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("%s", g_currentPath);
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled(">");
+            ImGui::SameLine();
+        }
+
+        // Render visible segments
+        for (size_t i = firstVisibleSegment; i < segments.size(); i++) {
+            if (i > firstVisibleSegment) {
+                ImGui::SameLine();
+                ImGui::TextDisabled(">");
+                ImGui::SameLine();
+            }
+
+            // Create button for this segment
+            char buttonId[256];
+            snprintf(buttonId, sizeof(buttonId), "%s##seg%d", segments[i].c_str(), (int)i);
+
+            if (ImGui::Button(buttonId)) {
+                NavigateToPath(accumulatedPaths[i].c_str());
+            }
+        }
+
+        ImGui::EndGroup();
+
+        // Get the actual size of the rendered breadcrumb bar
+        ImVec2 barEndPos = ImGui::GetItemRectMax();
+
+        // Draw an invisible button over the right side empty space for Win11-style click to edit
+        // Calculate the empty space on the right side
+        float usedBarWidth = barEndPos.x - barStartPos.x;
+        float emptySpaceWidth = availWidth - usedBarWidth;
+
+        if (emptySpaceWidth > 10.0f) {  // Only show clickable area if there's enough space
+            ImGui::SetCursorScreenPos(ImVec2(barEndPos.x, barStartPos.y));
+            ImGui::InvisibleButton("##AddressBarEmptySpace", ImVec2(emptySpaceWidth, barHeight));
+
+            // Win11-style: single click on empty space to enter edit mode
+            if (ImGui::IsItemClicked(0)) {
+                g_pathEditMode = true;
+                g_pathEditModeJustActivated = true;
+                strcpy(g_pathInput, g_currentPath);
+            }
+        }
+    } else {
+        // Edit mode: show text input
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::InputText("##PathInput", g_pathInput, MAX_PATH, ImGuiInputTextFlags_EnterReturnsTrue)) {
+            NavigateToPath(g_pathInput);
+            g_pathEditMode = false;
+            g_pathEditModeJustActivated = false;
+        }
+
+        // Exit edit mode on Escape or focus loss (but not on the first frame when just activated)
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            g_pathEditMode = false;
+            g_pathEditModeJustActivated = false;
+            strcpy(g_pathInput, g_currentPath);  // Restore current path
+        } else if (!g_pathEditModeJustActivated && !ImGui::IsItemActive() && !ImGui::IsItemFocused()) {
+            // Only exit on focus loss if not just activated
+            g_pathEditMode = false;
+            strcpy(g_pathInput, g_currentPath);  // Restore current path
+        }
+
+        // Auto-focus the input when entering edit mode
+        if (g_pathEditModeJustActivated) {
+            ImGui::SetKeyboardFocusHere(-1);
+            g_pathEditModeJustActivated = false;  // Clear the flag after setting focus
+        }
+    }
+
+    // File list
+    ImGui::BeginChild("FileList", ImVec2(-1, 0), true);
+
+    for (int i = 0; i < (int)g_fileList.size(); i++) {
+        const FileEntry& entry = g_fileList[i];
+
+        bool isSelected = (g_selectedFileIndex == i);
+        ImGuiSelectableFlags flags = ImGuiSelectableFlags_AllowDoubleClick;
+
+        // Build label with icon prefix using std::string to properly handle UTF-8
+        std::string label;
+        if (entry.name == "..") {
+            label = "[UP] " + entry.name;
+        } else if (entry.isDirectory) {
+            label = "[DIR] " + entry.name;
+        } else {
+            label = entry.name;
+        }
+
+        if (ImGui::Selectable(label.c_str(), isSelected, flags)) {
+            g_selectedFileIndex = i;
+
+            // Double-click handling
+            if (ImGui::IsMouseDoubleClicked(0)) {
+                if (entry.name == "..") {
+                    NavigateToParent();
+                } else if (entry.isDirectory) {
+                    NavigateToPath(entry.fullPath.c_str());
+                } else {
+                    // Load MIDI file and start playing immediately
+                    g_currentPlayingIndex = i;  // Update current playing index
+
+                    // Reset YM2163 chips to eliminate residual sound
+                    ResetAllYM2163Chips();
+
+                    // Initialize all channels
+                    InitializeAllChannels();
+                    stop_all_notes();
+                    g_midiPlayer.activeNotes.clear();
+
+                    if (LoadMIDIFile(entry.fullPath.c_str())) {
+                        // Reset progress bar
+                        g_midiPlayer.currentTick = 0;
+                        g_midiPlayer.pausedDuration = std::chrono::milliseconds(0);
+                        PlayMIDI();  // Auto-play on double-click
+                    }
+                }
+            }
+        }
+    }
+
+    ImGui::EndChild();
+}
+
+void RenderPianoKeyboard() {
+    ImGui::BeginChild("Piano", ImVec2(0, 150), true, ImGuiWindowFlags_HorizontalScrollbar);
+
+    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+    ImVec2 p = ImGui::GetCursorScreenPos();
+
+    float whiteKeyWidth = 20.0f;
+    float whiteKeyHeight = 100.0f;
+    float blackKeyWidth = 12.0f;
+    float blackKeyHeight = 60.0f;
+
+    int whiteKeyCount = 0;
+
+    // Draw B2
+    {
+        int keyIdx = 0;
+        float x = p.x + whiteKeyCount * whiteKeyWidth;
+        float y = p.y;
+
+        ImU32 color;
+        if (g_pianoKeyPressed[keyIdx]) {
+            if (g_pianoKeyFromKeyboard[keyIdx]) {
+                // Green for keyboard input
+                int velocity = g_pianoKeyVelocity[keyIdx];
+                float intensity = velocity / 127.0f;  // 0.0 to 1.0
+                int r = (int)(50 + 155 * intensity);   // 50 to 205
+                int g = 255;  // Full green
+                int b = (int)(100 + 100 * intensity);  // 100 to 200
+                color = IM_COL32(r, g, b, 255);
+            } else {
+                // Blue for MIDI playback
+                int velocity = g_pianoKeyVelocity[keyIdx];
+                float intensity = velocity / 127.0f;  // 0.0 to 1.0
+                int r = (int)(50 + 150 * intensity);  // 50 to 200
+                int g = (int)(100 + 155 * intensity); // 100 to 255
+                int b = 255;
+                color = IM_COL32(r, g, b, 255);
+            }
+        } else {
+            color = IM_COL32(255, 255, 255, 255);
+        }
+
+        draw_list->AddRectFilled(ImVec2(x, y),
+            ImVec2(x + whiteKeyWidth, y + whiteKeyHeight), color);
+        draw_list->AddRect(ImVec2(x, y),
+            ImVec2(x + whiteKeyWidth, y + whiteKeyHeight), IM_COL32(0, 0, 0, 255));
+
+        draw_list->AddText(ImVec2(x + 2, y + whiteKeyHeight - 18),
+            IM_COL32(0, 0, 0, 255), "B2");
+
+        whiteKeyCount++;
+    }
+
+    // Draw C3-B7 white keys
+    for (int octave = 1; octave <= 5; octave++) {
+        for (int note = 0; note <= 11; note++) {
+            if (g_isBlackNote[note]) continue;
+
+            int keyIdx = get_key_index(octave, note);
+            if (keyIdx < 0) continue;
+
+            float x = p.x + whiteKeyCount * whiteKeyWidth;
+            float y = p.y;
+
+            ImU32 color;
+            if (g_pianoKeyPressed[keyIdx]) {
+                if (g_pianoKeyFromKeyboard[keyIdx]) {
+                    // Green for keyboard input
+                    int velocity = g_pianoKeyVelocity[keyIdx];
+                    float intensity = velocity / 127.0f;  // 0.0 to 1.0
+                    int r = (int)(50 + 155 * intensity);   // 50 to 205
+                    int g = 255;  // Full green
+                    int b = (int)(100 + 100 * intensity);  // 100 to 200
+                    color = IM_COL32(r, g, b, 255);
+                } else {
+                    // Blue for MIDI playback
+                    int velocity = g_pianoKeyVelocity[keyIdx];
+                    float intensity = velocity / 127.0f;  // 0.0 to 1.0
+                    int r = (int)(50 + 150 * intensity);  // 50 to 200
+                    int g = (int)(100 + 155 * intensity); // 100 to 255
+                    int b = 255;
+                    color = IM_COL32(r, g, b, 255);
+                }
+            } else {
+                color = IM_COL32(255, 255, 255, 255);
+            }
+
+            draw_list->AddRectFilled(ImVec2(x, y),
+                ImVec2(x + whiteKeyWidth, y + whiteKeyHeight), color);
+            draw_list->AddRect(ImVec2(x, y),
+                ImVec2(x + whiteKeyWidth, y + whiteKeyHeight), IM_COL32(0, 0, 0, 255));
+
+            if (note == 0) {
+                char label[8];
+                sprintf(label, "C%d", octave + 2);
+                draw_list->AddText(ImVec2(x + 2, y + whiteKeyHeight - 18),
+                    IM_COL32(0, 0, 0, 255), label);
+            }
+
+            whiteKeyCount++;
+        }
+    }
+
+    // Draw black keys
+    whiteKeyCount = 1;
+    for (int octave = 1; octave <= 5; octave++) {
+        for (int note = 0; note <= 11; note++) {
+            if (!g_isBlackNote[note]) continue;
+
+            int keyIdx = get_key_index(octave, note);
+            if (keyIdx < 0) continue;
+
+            int whiteKeyIdx = 0;
+            int blackOffset = 14;
+
+            if (note == 1) { whiteKeyIdx = 0; blackOffset = 14; }
+            else if (note == 3) { whiteKeyIdx = 1; blackOffset = 14; }
+            else if (note == 6) { whiteKeyIdx = 3; blackOffset = 14; }
+            else if (note == 8) { whiteKeyIdx = 4; blackOffset = 14; }
+            else if (note == 10) { whiteKeyIdx = 5; blackOffset = 14; }
+
+            float baseX = p.x + (whiteKeyCount + whiteKeyIdx) * whiteKeyWidth;
+            float x = baseX + blackOffset;
+            float y = p.y;
+
+            ImU32 color;
+            if (g_pianoKeyPressed[keyIdx]) {
+                if (g_pianoKeyFromKeyboard[keyIdx]) {
+                    // Green for keyboard input
+                    int velocity = g_pianoKeyVelocity[keyIdx];
+                    float intensity = velocity / 127.0f;  // 0.0 to 1.0
+                    int r = (int)(40 + 140 * intensity);   // 40 to 180
+                    int g = 255;  // Full green
+                    int b = (int)(80 + 120 * intensity);   // 80 to 200
+                    color = IM_COL32(r, g, b, 255);
+                } else {
+                    // Blue for MIDI playback
+                    int velocity = g_pianoKeyVelocity[keyIdx];
+                    float intensity = velocity / 127.0f;  // 0.0 to 1.0
+                    int r = (int)(40 + 140 * intensity);  // 40 to 180
+                    int g = (int)(80 + 175 * intensity);  // 80 to 255
+                    int b = 255;
+                    color = IM_COL32(r, g, b, 255);
+                }
+            } else {
+                color = IM_COL32(0, 0, 0, 255);
+            }
+
+            draw_list->AddRectFilled(ImVec2(x, y),
+                ImVec2(x + blackKeyWidth, y + blackKeyHeight), color);
+            draw_list->AddRect(ImVec2(x, y),
+                ImVec2(x + blackKeyWidth, y + blackKeyHeight), IM_COL32(128, 128, 128, 255));
+        }
+        whiteKeyCount += 7;
+    }
+
+    // Display SUS indicator when sustain pedal is active
+    if (g_sustainPedalActive && g_enableSustainPedal) {
+        ImVec2 susPos = ImVec2(p.x + 10, p.y + whiteKeyHeight + 10);
+        draw_list->AddText(susPos, IM_COL32(255, 200, 0, 255), "SUS");
+    }
+
+    ImGui::EndChild();
+}
+
+void RenderChannelStatus() {
+    ImVec4 slot0Color = ImVec4(0.0f, 1.0f, 0.5f, 1.0f);  // Cyan-green for Slot0
+    ImVec4 slot1Color = ImVec4(0.5f, 0.5f, 1.0f, 1.0f);  // Light blue for Slot1
+    ImVec4 slot1DisabledColor = ImVec4(0.3f, 0.3f, 0.5f, 1.0f);  // Darker blue for disabled Slot1
+    ImVec4 drumActiveColor = ImVec4(0.0f, 1.0f, 0.0f, 1.0f);  // Green for active drums
+    ImVec4 releaseColor = ImVec4(1.0f, 1.0f, 0.0f, 0.8f);  // Yellow for Release phase
+
+    const int RELEASE_DISPLAY_TIME_MS = 1000;  // Show Release for 1 second after key release
+
+    // Always use side-by-side layout for both slots
+    float availWidth = ImGui::GetContentRegionAvail().x;
+    float boxWidth = (availWidth / 2.0f - 5);
+    float boxHeight = ImGui::GetContentRegionAvail().y - 5;  // Use available height to fill container
+
+    auto now = std::chrono::steady_clock::now();
+
+    // ===== Slot0 (Chip 0) Display - Tiled horizontally =====
+    ImGui::BeginChild("Slot0Channels", ImVec2(boxWidth, boxHeight), true);
+    ImGui::TextColored(slot0Color, "YM2163 Slot0 (used)");
+    ImGui::Separator();
+
+    // Display 4 channels with full info (Wave/Envelope/Volume)
+    for (int i = 0; i < 4; i++) {
+        if (g_channels[i].active) {
+            ImGui::TextColored(slot0Color, "CH%d: %s%d", i,
+                g_noteNames[g_channels[i].note],
+                g_channels[i].octave + 2);
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
+                "[%s/%s/%s]",
+                g_timbreNames[g_channels[i].timbre],
+                g_envelopeNames[g_channels[i].envelope],
+                g_volumeNames[g_channels[i].volume]);
+        } else {
+            // Check if channel is in Release phase
+            auto timeSinceRelease = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - g_channels[i].releaseTime).count();
+
+            if (g_channels[i].hasBeenUsed && timeSinceRelease < RELEASE_DISPLAY_TIME_MS) {
+                ImGui::TextColored(releaseColor, "CH%d: Release", i);
+            } else {
+                ImGui::TextDisabled("CH%d: ---", i);
+            }
+        }
+    }
+
+    // Drum status in Slot0 box (one line at bottom)
+    ImGui::Separator();
+    ImGui::Text("Drums:");
+    ImGui::SameLine();
+    for (int i = 0; i < 5; i++) {
+        if (g_drumActive[i]) {
+            ImGui::TextColored(drumActiveColor, "%s", g_drumNames[i]);
+        } else {
+            ImGui::TextDisabled("%s", g_drumNames[i]);
+        }
+        if (i < 4) ImGui::SameLine();
+    }
+    ImGui::EndChild();
+
+    // Tile horizontally (side by side) - always show both
+    ImGui::SameLine();
+
+    // ===== Slot1 (Chip 1) Display - Tiled horizontally =====
+    ImGui::BeginChild("Slot1Channels", ImVec2(boxWidth, boxHeight), true);
+
+    // Show different title based on whether Slot1 is enabled
+    if (g_enableSecondYM2163) {
+        ImGui::TextColored(slot1Color, "YM2163 Slot1 (used)");
+    } else {
+        ImGui::TextColored(slot1DisabledColor, "YM2163 Slot1 (unused)");
+    }
+    ImGui::Separator();
+
+    // Display 4 channels with full info (Wave/Envelope/Volume)
+    for (int i = 4; i < 8; i++) {
+        if (g_channels[i].active) {
+            ImGui::TextColored(slot1Color, "CH%d: %s%d", i,
+                g_noteNames[g_channels[i].note],
+                g_channels[i].octave + 2);
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
+                "[%s/%s/%s]",
+                g_timbreNames[g_channels[i].timbre],
+                g_envelopeNames[g_channels[i].envelope],
+                g_volumeNames[g_channels[i].volume]);
+        } else {
+            // Check if channel is in Release phase
+            auto timeSinceRelease = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - g_channels[i].releaseTime).count();
+
+            if (g_channels[i].hasBeenUsed && timeSinceRelease < RELEASE_DISPLAY_TIME_MS) {
+                ImGui::TextColored(releaseColor, "CH%d: Release", i);
+            } else {
+                ImGui::TextDisabled("CH%d: ---", i);
+            }
+        }
+    }
+
+    // Drum status in Slot1 box (same drums, one line at bottom)
+    ImGui::Separator();
+    ImGui::Text("Drums:");
+    ImGui::SameLine();
+    for (int i = 0; i < 5; i++) {
+        if (g_drumActive[i]) {
+            ImGui::TextColored(drumActiveColor, "%s", g_drumNames[i]);
+        } else {
+            ImGui::TextDisabled("%s", g_drumNames[i]);
+        }
+        if (i < 4) ImGui::SameLine();
+    }
+    ImGui::EndChild();
+}
+
+void RenderControls() {
+    ImGui::BeginChild("Controls", ImVec2(280, 0), true);
+
+    ImGui::Text("Controls");
+    ImGui::Separator();
+
+    ImGui::Text("Octave: B=%d", g_currentOctave);
+    if (g_currentOctave == 0) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("(B2 only)");
+    } else {
+        ImGui::SameLine();
+        ImGui::Text("(C%d-B%d)", g_currentOctave + 2, g_currentOctave + 2);
+    }
+    if (ImGui::Button("Oct +") && g_currentOctave < 5) {
+        stop_all_notes();
+        g_currentOctave++;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Oct -") && g_currentOctave > 0) {
+        stop_all_notes();
+        g_currentOctave--;
+    }
+
+    ImGui::Spacing();
+
+    ImGui::Text("Volume: %s", g_volumeNames[g_currentVolume]);
+    if (ImGui::Button("Vol +") && g_currentVolume > 0) g_currentVolume--;
+    ImGui::SameLine();
+    if (ImGui::Button("Vol -") && g_currentVolume < 3) g_currentVolume++;
+
+    ImGui::Spacing();
+    ImGui::Separator();
+
+    // MIDI Control Mode
+    ImGui::Text("MIDI Control Mode");
+    if (ImGui::RadioButton("Live Control", g_useLiveControl)) {
+        g_useLiveControl = true;
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("MIDI playback uses UI Wave/Envelope settings\n(Ignores config file)");
+    }
+
+    if (ImGui::RadioButton("Config Mode", !g_useLiveControl)) {
+        g_useLiveControl = false;
+        // When switching to Config Mode, load current instrument config to UI
+        LoadInstrumentConfigToUI(g_selectedInstrument);
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("MIDI playback uses config file settings\n(Wave/Envelope only affect keyboard play)");
+    }
+
+    ImGui::Spacing();
+
+    // Velocity mapping option
+    ImGui::Checkbox("Velocity Mapping", &g_enableVelocityMapping);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Map MIDI velocity to 4-level volume\n"
+                         "(Enable for dynamic volume control)");
+    }
+
+    // Dynamic velocity mapping option (sub-option, indented)
+    if (g_enableVelocityMapping) {
+        ImGui::Indent(20.0f);
+        if (ImGui::Checkbox("Dynamic Mapping", &g_enableDynamicVelocityMapping)) {
+            // Re-analyze current MIDI file if loaded
+            if (g_enableDynamicVelocityMapping && g_midiPlayer.midiFile.status()) {
+                AnalyzeVelocityDistribution();
+            }
+        }
+        if (ImGui::IsItemHovered()) {
+            if (g_enableDynamicVelocityMapping) {
+                ImGui::SetTooltip("Dynamic velocity mapping (ENABLED):\n"
+                                 "Analyzes MIDI file velocity distribution\n"
+                                 "Maps most common velocities to -6dB and -12dB\n"
+                                 "Maps peak velocities to 0dB\n"
+                                 "Maps very low velocities to Mute\n\n"
+                                 "Current thresholds:\n"
+                                 "  0dB: >= %d\n"
+                                 "  -6dB: %d-%d\n"
+                                 "  -12dB: %d-%d\n"
+                                 "  Mute: < %d",
+                                 g_velocityAnalysis.threshold_0dB,
+                                 g_velocityAnalysis.threshold_6dB, g_velocityAnalysis.threshold_0dB - 1,
+                                 g_velocityAnalysis.threshold_12dB, g_velocityAnalysis.threshold_6dB - 1,
+                                 g_velocityAnalysis.threshold_mute);
+            } else {
+                ImGui::SetTooltip("Fixed velocity mapping:\n"
+                                 "  0dB: 113-127\n"
+                                 "  -6dB: 64-112\n"
+                                 "  -12dB: 1-63\n"
+                                 "  Mute: 0");
+            }
+        }
+        ImGui::Unindent(20.0f);
+    }
+
+    // Sustain pedal mapping option
+    ImGui::Checkbox("Sustain Pedal", &g_enableSustainPedal);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Map sustain pedal (CC64) to envelope:\n"
+                         "Pedal Down: Fast, Pedal Up: Decay");
+    }
+
+    // Global media keys option
+    if (ImGui::Checkbox("Global Media Keys", &g_enableGlobalMediaKeys)) {
+        if (g_enableGlobalMediaKeys) {
+            RegisterGlobalMediaKeys();
+        } else {
+            UnregisterGlobalMediaKeys();
+        }
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Capture global media keys:\n"
+                         "Play/Pause, Next Track, Previous Track\n"
+                         "Works even when window is not focused");
+    }
+
+    // Auto-skip silence option
+    ImGui::Checkbox("Auto-Skip Silence", &g_enableAutoSkipSilence);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Automatically skip silence at the start of MIDI files\n"
+                         "Jumps to the first note to avoid waiting");
+    }
+
+    // v8: Second YM2163 chip control (moved here with other checkboxes)
+    if (ImGui::Checkbox("Enable 2nd YM2163 (Slot1)", &g_enableSecondYM2163)) {
+        if (g_ftHandle) {
+            ym2163_init();  // Re-initialize with new settings
+            if (g_enableSecondYM2163) {
+                log_command("Second YM2163 enabled - 8 channels total");
+            } else {
+                log_command("Second YM2163 disabled - 4 channels only");
+                // Stop any notes playing on chip 1
+                for (int i = 4; i < 8; i++) {
+                    if (g_channels[i].active) {
+                        stop_note(i);
+                    }
+                }
+            }
+        }
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Enable second YM2163 chip on SPFM Slot1\n"
+                         "Doubles polyphony: 4 -> 8 channels");
+    }
+
+    ImGui::Separator();
+
+    // Instrument Selector and Config Save
+    ImGui::Text("Instrument Editor");
+
+    // Build instrument combo list
+    static char instrumentPreview[128];
+    if (g_instrumentConfigs.count(g_selectedInstrument) > 0) {
+        snprintf(instrumentPreview, sizeof(instrumentPreview), "%d: %s",
+                 g_selectedInstrument, g_instrumentConfigs[g_selectedInstrument].name.c_str());
+    } else {
+        snprintf(instrumentPreview, sizeof(instrumentPreview), "%d: (undefined)", g_selectedInstrument);
+    }
+
+    // Set combo box width to full available width
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::BeginCombo("##InstrumentSelect", instrumentPreview, ImGuiComboFlags_HeightLarge)) {
+        for (int i = 0; i < 128; i++) {
+            char label[128];
+            if (g_instrumentConfigs.count(i) > 0) {
+                snprintf(label, sizeof(label), "%d: %s", i, g_instrumentConfigs[i].name.c_str());
+            } else {
+                snprintf(label, sizeof(label), "%d: (undefined)", i);
+            }
+
+            bool isSelected = (g_selectedInstrument == i);
+            if (ImGui::Selectable(label, isSelected)) {
+                g_selectedInstrument = i;
+                LoadInstrumentConfigToUI(i);
+            }
+            if (isSelected) {
+                ImGui::SetItemDefaultFocus();
+            }
+        }
+        ImGui::EndCombo();
+    }
+
+    // Handle mouse wheel for instrument selection
+    if (ImGui::IsItemHovered()) {
+        float wheel = ImGui::GetIO().MouseWheel;
+        if (wheel > 0.0f && g_selectedInstrument > 0) {
+            g_selectedInstrument--;
+            LoadInstrumentConfigToUI(g_selectedInstrument);
+        } else if (wheel < 0.0f && g_selectedInstrument < 127) {
+            g_selectedInstrument++;
+            LoadInstrumentConfigToUI(g_selectedInstrument);
+        }
+    }
+
+    // Load and Save buttons
+    float btnWidth = (ImGui::GetContentRegionAvail().x - 5.0f) / 2.0f;
+    if (ImGui::Button("Load Config", ImVec2(btnWidth, 0))) {
+        LoadInstrumentConfigToUI(g_selectedInstrument);
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Load selected instrument config to UI");
+    }
+
+    ImGui::SameLine();
+
+    if (ImGui::Button("Save Config", ImVec2(btnWidth, 0))) {
+        SaveInstrumentConfig(g_selectedInstrument);
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Save current Wave/Envelope to selected instrument");
+    }
+
+    ImGui::Spacing();
+
+    // Tuning button (full width)
+    if (ImGui::Button("Tuning", ImVec2(-1, 0))) {
+        g_showTuningWindow = !g_showTuningWindow;
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Open frequency tuning window");
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+
+    ImGui::Text("Envelope");
+    for (int i = 0; i < 4; i++) {
+        if (ImGui::RadioButton(g_envelopeNames[i], g_currentEnvelope == i)) {
+            g_currentEnvelope = i;
+        }
+        if (i % 2 == 0 && i < 3) ImGui::SameLine();
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+
+    ImGui::Text("Timbre");
+    for (int i = 1; i <= 5; i++) {
+        if (ImGui::RadioButton(g_timbreNames[i], g_currentTimbre == i)) {
+            g_currentTimbre = i;
+        }
+        if (i % 2 == 1 && i < 5) ImGui::SameLine();
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+
+    ImGui::Text("Drums (Numpad 1-5)");
+    for (int i = 0; i < 5; i++) {
+        ImGui::PushID(i);
+        if (ImGui::Button(g_drumNames[i], ImVec2(45, 40))) {
+            play_drum(g_drumBits[i]);
+        }
+        if (i < 4) ImGui::SameLine();
+        ImGui::PopID();
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+
+    ImGui::EndChild();
+}
+
+void RenderLog() {
+    // Get available height for splitting
+    float availHeight = ImGui::GetContentRegionAvail().y;
+    float historyHeight = availHeight * 0.35f;  // 35% for history
+    float logHeight = availHeight * 0.65f;  // 65% for log
+
+    // ===== MIDI Folder History Section =====
+    ImGui::Text("MIDI Folder History");
+    ImGui::SameLine();
+    if (ImGui::Button("Clear All##History")) {
+        ClearMIDIFolderHistory();
+    }
+    ImGui::Separator();
+
+    ImGui::BeginChild("HistoryRegion", ImVec2(0, historyHeight), true, ImGuiWindowFlags_HorizontalScrollbar);
+
+    if (g_midiFolderHistory.empty()) {
+        ImGui::TextDisabled("No MIDI folder history yet...");
+        ImGui::TextDisabled("Navigate to folders containing MIDI files to build history.");
+    } else {
+        for (int i = 0; i < (int)g_midiFolderHistory.size(); i++) {
+            const std::string& path = g_midiFolderHistory[i];
+
+            // Display folder path as button (clickable)
+            ImGui::PushID(i);
+
+            // Extract folder name from path
+            size_t lastSlash = path.find_last_of("\\/");
+            std::string folderName = (lastSlash != std::string::npos) ? path.substr(lastSlash + 1) : path;
+
+            // Clickable folder entry
+            if (ImGui::Selectable(folderName.c_str(), false)) {
+                NavigateToPath(path.c_str());
+            }
+
+            // Show full path on hover
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("%s", path.c_str());
+            }
+
+            // Context menu for delete
+            if (ImGui::BeginPopupContextItem()) {
+                if (ImGui::MenuItem("Remove from history")) {
+                    RemoveMIDIFolderHistoryEntry(i);
+                }
+                ImGui::EndPopup();
+            }
+
+            ImGui::PopID();
+        }
+    }
+
+    ImGui::EndChild();
+
+    // ===== Log Section =====
+    ImGui::Text("Log");
+    ImGui::SameLine();
+    ImGui::Checkbox("Auto-scroll", &g_autoScroll);
+    ImGui::SameLine();
+    if (ImGui::Button("Clear##Log")) {
+        g_logBuffer.clear();
+        g_logDisplayBuffer[0] = '\0';
+        g_lastLogSize = 0;
+    }
+    ImGui::Separator();
+
+    size_t copyLen = (g_logBuffer.length() < sizeof(g_logDisplayBuffer) - 1) ?
+                     g_logBuffer.length() : sizeof(g_logDisplayBuffer) - 1;
+    memcpy(g_logDisplayBuffer, g_logBuffer.c_str(), copyLen);
+    g_logDisplayBuffer[copyLen] = '\0';
+
+    bool log_changed = (g_logBuffer.length() != g_lastLogSize);
+    g_lastLogSize = g_logBuffer.length();
+
+    if (g_autoScroll && log_changed) {
+        g_logScrollToBottom = true;
+    }
+
+    ImGui::BeginChild("LogScrollRegion", ImVec2(0, logHeight), true, ImGuiWindowFlags_HorizontalScrollbar);
+
+    ImVec2 text_size = ImGui::CalcTextSize(g_logDisplayBuffer, NULL, false, -1.0f);
+    float line_height = ImGui::GetTextLineHeightWithSpacing();
+    float min_visible_height = ImGui::GetContentRegionAvail().y;
+
+    float input_height = (text_size.y > min_visible_height) ? text_size.y + line_height * 2 : min_visible_height;
+
+    ImGui::InputTextMultiline("##LogText",
+        g_logDisplayBuffer,
+        sizeof(g_logDisplayBuffer),
+        ImVec2(-1, input_height),
+        ImGuiInputTextFlags_ReadOnly);
+
+    if (g_logScrollToBottom) {
+        ImGui::SetScrollY(ImGui::GetScrollMaxY());
+        g_logScrollToBottom = false;
+    }
+
+    ImGui::EndChild();
+}
+
+// ===== Tuning Window =====
+
+void RenderTuningWindow() {
+    if (!g_showTuningWindow) return;
+
+    ImGui::SetNextWindowSize(ImVec2(700, 600), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Frequency Tuning", &g_showTuningWindow)) {
+        ImGui::Text("Adjust YM2163 frequency values (FNUM) for each note");
+        ImGui::Text("Range: 0-2047 | Mouse wheel: +/-10 per step");
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        // Load and Save buttons
+        float btnWidth = (ImGui::GetContentRegionAvail().x - 5.0f) / 2.0f;
+        if (ImGui::Button("Load All Frequencies", ImVec2(btnWidth, 0))) {
+            LoadFrequenciesFromINI();
+            log_command("All frequencies loaded from INI");
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Load all frequency values from ym2163_midi_config.ini");
+        }
+
+        ImGui::SameLine();
+
+        if (ImGui::Button("Save All Frequencies", ImVec2(btnWidth, 0))) {
+            SaveFrequenciesToINI();
+            log_command("All frequencies saved to INI");
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Save all frequency values to ym2163_midi_config.ini");
+        }
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        // Base frequencies (C3-C6 octaves, 12 notes)
+        ImGui::TextColored(ImVec4(0.0f, 1.0f, 1.0f, 1.0f), "Base Frequencies (C3-C6 octaves)");
+        ImGui::Separator();
+
+        for (int i = 0; i < 12; i++) {
+            ImGui::PushID(i);
+            ImGui::Text("%s:", g_noteNames[i]);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(120);
+
+            // InputInt with mouse wheel support
+            if (ImGui::InputInt("", &g_fnums[i], 1, 10, ImGuiInputTextFlags_CharsDecimal)) {
+                if (g_fnums[i] < 0) g_fnums[i] = 0;
+                if (g_fnums[i] > 2047) g_fnums[i] = 2047;
+                log_command("Base Freq updated: %s = %d", g_noteNames[i], g_fnums[i]);
+            }
+
+            // Mouse wheel adjustment
+            if (ImGui::IsItemHovered()) {
+                float wheel = ImGui::GetIO().MouseWheel;
+                if (wheel != 0.0f) {
+                    g_fnums[i] += (int)(wheel * 10);
+                    if (g_fnums[i] < 0) g_fnums[i] = 0;
+                    if (g_fnums[i] > 2047) g_fnums[i] = 2047;
+                    log_command("Base Freq updated: %s = %d", g_noteNames[i], g_fnums[i]);
+                }
+            }
+
+            if ((i + 1) % 6 != 0) ImGui::SameLine();
+            ImGui::PopID();
+        }
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        // B2 special frequency (lowest note)
+        ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "B2 Frequency (Lowest Note)");
+        ImGui::Separator();
+
+        ImGui::PushID(100);
+        ImGui::Text("B2:");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(120);
+
+        if (ImGui::InputInt("", &g_fnum_b2, 1, 10, ImGuiInputTextFlags_CharsDecimal)) {
+            if (g_fnum_b2 < 0) g_fnum_b2 = 0;
+            if (g_fnum_b2 > 2047) g_fnum_b2 = 2047;
+            log_command("B2 Freq updated: B2 = %d", g_fnum_b2);
+        }
+
+        if (ImGui::IsItemHovered()) {
+            float wheel = ImGui::GetIO().MouseWheel;
+            if (wheel != 0.0f) {
+                g_fnum_b2 += (int)(wheel * 10);
+                if (g_fnum_b2 < 0) g_fnum_b2 = 0;
+                if (g_fnum_b2 > 2047) g_fnum_b2 = 2047;
+                log_command("B2 Freq updated: B2 = %d", g_fnum_b2);
+            }
+        }
+        ImGui::PopID();
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        // C7 octave frequencies (C7-B7, 12 notes)
+        ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "C7 Octave Frequencies (C7-B7)");
+        ImGui::Separator();
+
+        for (int i = 0; i < 12; i++) {
+            ImGui::PushID(200 + i);
+            ImGui::Text("%s7:", g_noteNames[i]);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(120);
+
+            if (ImGui::InputInt("", &g_fnums_c7[i], 1, 10, ImGuiInputTextFlags_CharsDecimal)) {
+                if (g_fnums_c7[i] < 0) g_fnums_c7[i] = 0;
+                if (g_fnums_c7[i] > 2047) g_fnums_c7[i] = 2047;
+                log_command("C7 Freq updated: %s7 = %d", g_noteNames[i], g_fnums_c7[i]);
+            }
+
+            if (ImGui::IsItemHovered()) {
+                float wheel = ImGui::GetIO().MouseWheel;
+                if (wheel != 0.0f) {
+                    g_fnums_c7[i] += (int)(wheel * 10);
+                    if (g_fnums_c7[i] < 0) g_fnums_c7[i] = 0;
+                    if (g_fnums_c7[i] > 2047) g_fnums_c7[i] = 2047;
+                    log_command("C7 Freq updated: %s7 = %d", g_noteNames[i], g_fnums_c7[i]);
+                }
+            }
+
+            if ((i + 1) % 6 != 0) ImGui::SameLine();
+            ImGui::PopID();
+        }
+
+        ImGui::Spacing();
+    }
+    ImGui::End();
+}
+
+// ===== DirectX 11 Setup =====
+
+bool CreateDeviceD3D(HWND hWnd) {
+    DXGI_SWAP_CHAIN_DESC sd;
+    ZeroMemory(&sd, sizeof(sd));
+    sd.BufferCount = 2;
+    sd.BufferDesc.Width = 0;
+    sd.BufferDesc.Height = 0;
+    sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.BufferDesc.RefreshRate.Numerator = 60;
+    sd.BufferDesc.RefreshRate.Denominator = 1;
+    sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.OutputWindow = hWnd;
+    sd.SampleDesc.Count = 1;
+    sd.SampleDesc.Quality = 0;
+    sd.Windowed = TRUE;
+    sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+
+    UINT createDeviceFlags = 0;
+    D3D_FEATURE_LEVEL featureLevel;
+    const D3D_FEATURE_LEVEL featureLevelArray[2] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0, };
+    HRESULT res = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, createDeviceFlags,
+        featureLevelArray, 2, D3D11_SDK_VERSION, &sd, &g_pSwapChain, &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext);
+
+    if (res == DXGI_ERROR_UNSUPPORTED)
+        res = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, createDeviceFlags,
+            featureLevelArray, 2, D3D11_SDK_VERSION, &sd, &g_pSwapChain, &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext);
+
+    if (res != S_OK)
+        return false;
+
+    ID3D11Texture2D* pBackBuffer;
+    g_pSwapChain->GetBuffer(0, IID_PPV_ARGS(&pBackBuffer));
+    g_pd3dDevice->CreateRenderTargetView(pBackBuffer, nullptr, &g_mainRenderTargetView);
+    pBackBuffer->Release();
+
+    return true;
+}
+
+void CleanupDeviceD3D() {
+    if (g_mainRenderTargetView) { g_mainRenderTargetView->Release(); g_mainRenderTargetView = nullptr; }
+    if (g_pSwapChain) { g_pSwapChain->Release(); g_pSwapChain = nullptr; }
+    if (g_pd3dDeviceContext) { g_pd3dDeviceContext->Release(); g_pd3dDeviceContext = nullptr; }
+    if (g_pd3dDevice) { g_pd3dDevice->Release(); g_pd3dDevice = nullptr; }
+}
+
+void HandleKeyPress(int vk) {
+    if (g_keyStates[vk]) return;
+    g_keyStates[vk] = true;
+
+    // Don't process keyboard piano input when any input field is active
+    if (g_isInputActive) {
+        return;
+    }
+
+    if (vk == VK_PRIOR && g_currentOctave < 5) {
+        stop_all_notes();
+        g_currentOctave++;
+        return;
+    } else if (vk == VK_NEXT && g_currentOctave > 0) {
+        stop_all_notes();
+        g_currentOctave--;
+        return;
+    }
+
+    if (vk == VK_UP && g_currentVolume > 0) {
+        g_currentVolume--;
+        return;
+    } else if (vk == VK_DOWN && g_currentVolume < 3) {
+        g_currentVolume++;
+        return;
+    }
+
+    if (vk >= VK_F1 && vk <= VK_F4) {
+        g_currentEnvelope = vk - VK_F1;
+        return;
+    }
+
+    if (vk >= VK_F5 && vk <= VK_F9) {
+        g_currentTimbre = vk - VK_F5 + 1;
+        return;
+    }
+
+    if (vk >= VK_NUMPAD1 && vk <= VK_NUMPAD5) {
+        int drumIdx = vk - VK_NUMPAD1;
+        play_drum(g_drumBits[drumIdx]);
+        return;
+    }
+
+    for (int i = 0; i < g_numKeyMappings; i++) {
+        if (g_keyMappings[i].vk == vk) {
+            int note = g_keyMappings[i].note;
+            int octave = g_currentOctave + g_keyMappings[i].octave_offset;
+
+            bool valid = false;
+            if (octave == 0 && note == 11) {
+                valid = true;
+            } else if (octave >= 1 && octave <= 5) {
+                valid = true;
+            }
+
+            if (valid) {
+                int channel = find_free_channel();
+                if (channel >= 0) {
+                    play_note(channel, note, octave);
+
+                    int keyIdx = get_key_index(octave, note);
+                    if (keyIdx >= 0 && keyIdx < 61) {
+                        g_pianoKeyPressed[keyIdx] = true;
+                        g_pianoKeyFromKeyboard[keyIdx] = true;  // Mark as keyboard input
+                        g_pianoKeyVelocity[keyIdx] = 96;  // Default keyboard velocity
+                    }
+                }
+            }
+            break;
+        }
+    }
+}
+
+void HandleKeyRelease(int vk) {
+    g_keyStates[vk] = false;
+
+    for (int i = 0; i < g_numKeyMappings; i++) {
+        if (g_keyMappings[i].vk == vk) {
+            int note = g_keyMappings[i].note;
+            int octave = g_currentOctave + g_keyMappings[i].octave_offset;
+
+            bool valid = false;
+            if (octave == 0 && note == 11) {
+                valid = true;
+            } else if (octave >= 1 && octave <= 5) {
+                valid = true;
+            }
+
+            if (valid) {
+                int channel = find_channel_playing(note, octave);
+
+                if (channel >= 0) {
+                    stop_note(channel);
+
+                    int keyIdx = get_key_index(octave, note);
+                    if (keyIdx >= 0 && keyIdx < 61) {
+                        g_pianoKeyPressed[keyIdx] = false;
+                        g_pianoKeyFromKeyboard[keyIdx] = false;  // Clear keyboard flag
+                        g_pianoKeyVelocity[keyIdx] = 0;  // Clear velocity
+                    }
+                }
+            }
+            break;
+        }
+    }
+}
+
+// ===== Window Procedure =====
+
+LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
+        return true;
+
+    switch (msg) {
+        case WM_SIZE:
+            if (wParam == SIZE_MINIMIZED)
+                return 0;
+            g_ResizeWidth = (UINT)LOWORD(lParam);
+            g_ResizeHeight = (UINT)HIWORD(lParam);
+            return 0;
+
+        case WM_SYSCOMMAND:
+            if ((wParam & 0xfff0) == SC_KEYMENU)
+                return 0;
+            break;
+
+        case WM_ENTERSIZEMOVE:
+            // Window is being dragged or resized - start timer to keep MIDI playing
+            g_isWindowDragging = true;
+            SetTimer(hWnd, TIMER_MIDI_UPDATE, 16, NULL);  // ~60Hz update
+            return 0;
+
+        case WM_EXITSIZEMOVE:
+            // Window drag/resize finished - stop timer
+            g_isWindowDragging = false;
+            KillTimer(hWnd, TIMER_MIDI_UPDATE);
+            return 0;
+
+        case WM_TIMER:
+            if (wParam == TIMER_MIDI_UPDATE && g_isWindowDragging) {
+                // Continue MIDI playback during window drag
+                UpdateMIDIPlayback();
+                UpdateDrumStates();
+                CleanupStuckChannels();
+            }
+            return 0;
+
+        case WM_HOTKEY:
+            // Handle global media key presses
+            if (g_enableGlobalMediaKeys) {
+                switch (wParam) {
+                    case HK_PLAY_PAUSE:
+                        // Toggle play/pause
+                        if (g_midiPlayer.isPlaying) {
+                            if (g_midiPlayer.isPaused) {
+                                PlayMIDI();  // Resume
+                            } else {
+                                PauseMIDI();  // Pause
+                            }
+                        } else {
+                            PlayMIDI();  // Start playing
+                        }
+                        break;
+
+                    case HK_NEXT_TRACK:
+                        PlayNextMIDI();
+                        break;
+
+                    case HK_PREV_TRACK:
+                        PlayPreviousMIDI();
+                        break;
+                }
+            }
+            return 0;
+
+        case WM_KEYDOWN:
+            HandleKeyPress((int)wParam);
+            return 0;
+
+        case WM_KEYUP:
+            HandleKeyRelease((int)wParam);
+            return 0;
+
+        case WM_DESTROY:
+            SaveFrequenciesToINI();
+            if (g_enableGlobalMediaKeys) {
+                UnregisterGlobalMediaKeys();
+            }
+            if (g_ftHandle) FT_Close(g_ftHandle);
+            PostQuitMessage(0);
+            return 0;
+    }
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
+}
+
+// ===== Main =====
+
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    // Set DPI awareness
+    HMODULE user32 = LoadLibraryA("user32.dll");
+    if (user32) {
+        typedef BOOL (WINAPI *SetProcessDpiAwarenessContext_t)(void*);
+        SetProcessDpiAwarenessContext_t func =
+            (SetProcessDpiAwarenessContext_t)GetProcAddress(user32, "SetProcessDpiAwarenessContext");
+        if (func) {
+            func((void*)-4);
+        } else {
+            HMODULE shcore = LoadLibraryA("shcore.dll");
+            if (shcore) {
+                typedef HRESULT (WINAPI *SetProcessDpiAwareness_t)(int);
+                SetProcessDpiAwareness_t func2 =
+                    (SetProcessDpiAwareness_t)GetProcAddress(shcore, "SetProcessDpiAwareness");
+                if (func2) {
+                    func2(2);
+                }
+                FreeLibrary(shcore);
+            }
+        }
+        FreeLibrary(user32);
+    }
+
+    // Initialize INI file paths
+    char exePath[MAX_PATH];
+    GetModuleFileNameA(NULL, exePath, MAX_PATH);
+    char* lastSlash = strrchr(exePath, '\\');
+    if (lastSlash) {
+        *(lastSlash + 1) = '\0';
+        snprintf(g_iniFilePath, MAX_PATH, "%sym2163_tuning.ini", exePath);
+        snprintf(g_midiConfigPath, MAX_PATH, "%sym2163_midi_config.ini", exePath);
+    } else {
+        strcpy(g_iniFilePath, "ym2163_tuning.ini");
+        strcpy(g_midiConfigPath, "ym2163_midi_config.ini");
+    }
+
+    // Create window
+    WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L, GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr, L"YM2163PianoV8", nullptr };
+    RegisterClassExW(&wc);
+    HWND hwnd = CreateWindowW(wc.lpszClassName, L"YM2163 Virtual Piano v8 - Dual YM2163",
+        WS_OVERLAPPEDWINDOW, 100, 100, 1400, 900, nullptr, nullptr, wc.hInstance, nullptr);
+
+    // Save window handle for global media keys
+    g_mainWindow = hwnd;
+
+    if (!CreateDeviceD3D(hwnd)) {
+        CleanupDeviceD3D();
+        UnregisterClassW(wc.lpszClassName, wc.hInstance);
+        return 1;
+    }
+
+    ShowWindow(hwnd, SW_SHOWDEFAULT);
+    UpdateWindow(hwnd);
+
+    // Setup ImGui
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+
+    io.FontGlobalScale = 1.0f;
+    io.FontAllowUserScaling = false;
+
+    ImFontConfig fontConfig;
+    fontConfig.OversampleH = 1;
+    fontConfig.OversampleV = 1;
+    fontConfig.PixelSnapH = true;
+
+    // First, load a base font with Chinese support
+    ImFont* font = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\msyh.ttc", 20.0f, &fontConfig,
+        io.Fonts->GetGlyphRangesChineseSimplifiedCommon());
+
+    if (!font) {
+        // Fallback to SimSun
+        font = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\simsun.ttc", 20.0f, &fontConfig,
+            io.Fonts->GetGlyphRangesChineseSimplifiedCommon());
+    }
+
+    if (!font) {
+        // Fallback to default
+        fontConfig.SizePixels = 20.0f;
+        font = io.Fonts->AddFontDefault(&fontConfig);
+    }
+
+    // Now merge Korean font (Malgun Gothic) into the same font
+    if (font) {
+        ImFontConfig mergeConfig;
+        mergeConfig.MergeMode = true;  // Merge into previous font
+        mergeConfig.OversampleH = 1;
+        mergeConfig.OversampleV = 1;
+        mergeConfig.PixelSnapH = true;
+
+        // Add Korean glyphs from Malgun Gothic
+        io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\malgun.ttf", 20.0f, &mergeConfig,
+            io.Fonts->GetGlyphRangesKorean());
+
+        // Also try to add Japanese glyphs
+        io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\msgothic.ttc", 20.0f, &mergeConfig,
+            io.Fonts->GetGlyphRangesJapanese());
+    }
+
+    ImGuiStyle& style = ImGui::GetStyle();
+    style.AntiAliasedLines = false;
+    style.AntiAliasedLinesUseTex = false;
+    style.AntiAliasedFill = false;
+
+    ImGui_ImplWin32_Init(hwnd);
+    ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
+
+    // Initialize FTDI and YM2163
+    LoadFrequenciesFromINI();
+    LoadMIDIConfig();
+    InitializeFileBrowser();
+
+    // Load config to UI if starting in Config Mode
+    if (!g_useLiveControl) {
+        LoadInstrumentConfigToUI(g_selectedInstrument);
+    }
+
+    if (ftdi_init(0) == 0) {
+        ym2163_init();
+    } else {
+        log_command("ERROR: Failed to initialize FTDI device!");
+    }
+
+    // Register global media keys if enabled by default
+    if (g_enableGlobalMediaKeys) {
+        RegisterGlobalMediaKeys();
+    }
+
+    // Main loop
+    bool done = false;
+    while (!done) {
+        MSG msg;
+        while (PeekMessage(&msg, nullptr, 0U, 0U, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+            if (msg.message == WM_QUIT)
+                done = true;
+        }
+        if (done)
+            break;
+
+        // Handle window resize
+        if (g_ResizeWidth != 0 && g_ResizeHeight != 0) {
+            if (g_mainRenderTargetView) { g_mainRenderTargetView->Release(); g_mainRenderTargetView = nullptr; }
+            g_pSwapChain->ResizeBuffers(0, g_ResizeWidth, g_ResizeHeight, DXGI_FORMAT_UNKNOWN, 0);
+            g_ResizeWidth = g_ResizeHeight = 0;
+            ID3D11Texture2D* pBackBuffer;
+            g_pSwapChain->GetBuffer(0, IID_PPV_ARGS(&pBackBuffer));
+            g_pd3dDevice->CreateRenderTargetView(pBackBuffer, nullptr, &g_mainRenderTargetView);
+            pBackBuffer->Release();
+        }
+
+        // Update MIDI playback
+        UpdateMIDIPlayback();
+
+        // Update drum states
+        UpdateDrumStates();
+
+        // Cleanup stuck channels
+        CleanupStuckChannels();
+
+        // Start ImGui frame
+        ImGui_ImplDX11_NewFrame();
+        ImGui_ImplWin32_NewFrame();
+        ImGui::NewFrame();
+
+        // Render UI
+        ImGui::SetNextWindowPos(ImVec2(0, 0));
+        ImGui::SetNextWindowSize(io.DisplaySize);
+        ImGui::Begin("YM2163 Piano", nullptr,
+            ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
+            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+
+        ImGui::BeginChild("LeftPane", ImVec2(300, 0), true);
+        RenderControls();
+        ImGui::EndChild();
+
+        ImGui::SameLine();
+
+        ImGui::BeginChild("RightPane", ImVec2(0, 0), false);
+
+        // Piano keyboard area with channel status on the right
+        // Status area needs enough width for 2 boxes side by side (Slot0, Slot1)
+        // Keep width fixed since RenderChannelStatus() always shows both boxes
+        float statusAreaWidth = 560;  // 2 boxes side by side (each box ~270px)
+        float pianoStatusHeight = 170;  // Optimized height: title + 4 channels + separator + drums + margins
+        ImGui::BeginChild("PianoArea", ImVec2(ImGui::GetContentRegionAvail().x - statusAreaWidth, pianoStatusHeight), false);
+        RenderPianoKeyboard();
+        ImGui::EndChild();
+
+        ImGui::SameLine();
+
+        // Channel status display - horizontal tiling of chip status boxes (with drums inside)
+        ImGui::BeginChild("StatusArea", ImVec2(statusAreaWidth - 10, pianoStatusHeight), false);
+        RenderChannelStatus();
+        ImGui::EndChild();
+
+        // Bottom section: split into MIDI Player (left) and Log (right)
+        ImGui::BeginChild("BottomLeft", ImVec2(ImGui::GetContentRegionAvail().x * 0.5f, 0), true);
+        RenderMIDIPlayer();
+        ImGui::EndChild();
+
+        ImGui::SameLine();
+
+        ImGui::BeginChild("BottomRight", ImVec2(0, 0), true);
+        RenderLog();
+        ImGui::EndChild();
+
+        ImGui::EndChild();
+
+        ImGui::End();
+
+        // Render tuning window if open
+        RenderTuningWindow();
+
+        // Check if any input field is active (disable keyboard piano)
+        g_isInputActive = ImGui::IsAnyItemActive();
+
+        // Rendering
+        ImGui::Render();
+        const float clear_color[4] = { 0.45f, 0.55f, 0.60f, 1.00f };
+        g_pd3dDeviceContext->OMSetRenderTargets(1, &g_mainRenderTargetView, nullptr);
+        g_pd3dDeviceContext->ClearRenderTargetView(g_mainRenderTargetView, clear_color);
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+
+        HRESULT hr = g_pSwapChain->Present(1, 0);
+        g_SwapChainOccluded = (hr == DXGI_STATUS_OCCLUDED);
+
+        // Frame rate control: ~60 FPS (16ms per frame)
+        // This prevents high CPU usage and ensures stable playback even when other windows are active
+        Sleep(16);
+    }
+
+    // Cleanup
+    ImGui_ImplDX11_Shutdown();
+    ImGui_ImplWin32_Shutdown();
+    ImGui::DestroyContext();
+
+    CleanupDeviceD3D();
+    DestroyWindow(hwnd);
+    UnregisterClassW(wc.lpszClassName, wc.hInstance);
+
+    return 0;
+}
