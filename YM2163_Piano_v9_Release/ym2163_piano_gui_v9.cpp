@@ -1021,6 +1021,15 @@ void stop_all_notes() {
     }
 }
 
+// Reset all piano key UI states (call when switching songs to clear residual pressed keys)
+void ResetPianoKeyStates() {
+    for (int i = 0; i < 61; i++) {
+        g_pianoKeyPressed[i] = false;
+        g_pianoKeyVelocity[i] = 0;
+        g_pianoKeyFromKeyboard[i] = false;
+    }
+}
+
 // Reset YM2163 chip to eliminate residual sound/notes
 void ResetYM2163Chip(int chipIndex) {
     if (!g_ftHandle) return;
@@ -1586,6 +1595,7 @@ bool LoadMIDIFile(const char* filename) {
     g_midiPlayer.ticksPerQuarterNote = g_midiPlayer.midiFile.getTicksPerQuarterNote();
     g_midiPlayer.tempo = 500000.0;  // Default tempo
     g_midiPlayer.activeNotes.clear();
+    ResetPianoKeyStates();
 
     // Reset sustain pedal state when loading new file
     g_sustainPedalActive = false;
@@ -1713,6 +1723,7 @@ void PlayNextMIDI() {
         InitializeAllChannels();
         stop_all_notes();
         g_midiPlayer.activeNotes.clear();
+        ResetPianoKeyStates();
 
         if (LoadMIDIFile(g_fileList[nextIndex].fullPath.c_str())) {
             // Ensure progress bar is reset to 0
@@ -1736,6 +1747,7 @@ void PlayPreviousMIDI() {
         InitializeAllChannels();
         stop_all_notes();
         g_midiPlayer.activeNotes.clear();
+        ResetPianoKeyStates();
 
         if (LoadMIDIFile(g_fileList[prevIndex].fullPath.c_str())) {
             // Ensure progress bar is reset to 0
@@ -1763,6 +1775,7 @@ void PlayMIDI() {
         g_midiPlayer.pausedDuration = std::chrono::milliseconds(0);
         stop_all_notes();
         g_midiPlayer.activeNotes.clear();
+        ResetPianoKeyStates();
         // Reset sustain pedal state when starting new playback
         g_sustainPedalActive = false;
 
@@ -1837,6 +1850,7 @@ void StopMIDI() {
     g_midiPlayer.currentTick = 0;
     stop_all_notes();
     g_midiPlayer.activeNotes.clear();
+    ResetPianoKeyStates();
     // Reset sustain pedal state when stopping playback
     g_sustainPedalActive = false;
     log_command("MIDI playback stopped");
@@ -2287,6 +2301,7 @@ void RenderMIDIPlayer() {
             // Stop all currently playing notes
             stop_all_notes();
             g_midiPlayer.activeNotes.clear();
+            ResetPianoKeyStates();
 
             log_command("Seek to progress: %.1f%% (time: %s)", clickPos * 100.0f, currentTimeStr.c_str());
         }
@@ -2535,6 +2550,7 @@ void RenderMIDIPlayer() {
                     InitializeAllChannels();
                     stop_all_notes();
                     g_midiPlayer.activeNotes.clear();
+                    ResetPianoKeyStates();
 
                     if (LoadMIDIFile(entry.fullPath.c_str())) {
                         // Reset progress bar
