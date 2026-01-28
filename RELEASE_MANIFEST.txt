@@ -1,0 +1,138 @@
+================================================================================
+YM2163 Piano GUI v8 - Release Package Manifest
+================================================================================
+
+Release Date: 2026-01-28
+Version: v8.0
+Compiler: G++ 15.2.0 (MinGW)
+Platform: Windows/Linux
+
+================================================================================
+PACKAGE CONTENTS
+================================================================================
+
+1. EXECUTABLE
+   - ym2163_piano_gui_v8.exe (4.4 MB)
+     Main application executable for Windows
+
+2. SOURCE CODE
+   - ym2163_piano_gui_v8.cpp (118 KB)
+     Complete source code with all v8 features
+
+3. DOCUMENTATION
+   - README.md (3.2 KB)
+     Package overview and quick reference
+   - QUICK_START_v8.md (9.1 KB)
+     Detailed quick start guide
+   - UPDATE_v8_NOTES.md (13 KB)
+     Complete v8 feature documentation and changelog
+
+4. CONFIGURATION
+   - ym2163_midi_config.ini (11 KB)
+     MIDI instrument configuration file
+
+5. BUILD TOOLS
+   - build_v8.sh (2.6 KB)
+     Linux/MinGW compilation script
+
+6. DEPENDENCIES
+   - ftdi_driver/ (FTDI USB driver library)
+   - imgui/ (ImGui GUI framework)
+   - midifile/ (MIDI file parsing library)
+   - ftd2xx64.dll (633 KB, FTDI driver DLL)
+
+================================================================================
+V8 KEY FEATURES
+================================================================================
+
+✓ Dual YM2163 Chip Support (8 channels total)
+✓ Intelligent Channel Allocation Algorithm
+✓ Release Phase Display (Yellow indicator for 1 second)
+✓ Time-based Progress Bar (MM:SS format)
+✓ Auto-skip Silence at Beginning
+✓ Complete Channel Initialization on Track Switch
+✓ Slot1 Always Visible (used/unused status)
+✓ Real-time MIDI Playback
+✓ 4-5 Octave Piano Keyboard
+✓ Drum Sound Effects
+✓ Real-time Timbre/Envelope/Volume Control
+✓ Frequency Tuning Configuration
+✓ Unicode Path Support
+
+================================================================================
+INSTALLATION & USAGE
+================================================================================
+
+Windows:
+1. Extract the package
+2. Run ym2163_piano_gui_v8.exe
+3. Connect YM2163 hardware via USB
+4. Load MIDI files and play
+
+Linux/MinGW:
+1. Extract the package
+2. Run: bash build_v8.sh
+3. Run the compiled executable
+4. Connect YM2163 hardware via USB
+
+================================================================================
+SYSTEM REQUIREMENTS
+================================================================================
+
+- Windows 10/11 or Linux with MinGW
+- USB interface for YM2163 hardware
+- DirectX 11 (Windows)
+- FTDI drivers installed
+
+================================================================================
+FILE SIZES
+================================================================================
+
+Executable:        4.4 MB
+Source Code:       118 KB
+Documentation:     25 KB
+Configuration:     11 KB
+FTDI DLL:          633 KB
+Dependencies:      ~2 MB (ftdi_driver, imgui, midifile)
+Total Package:     ~7.2 MB (uncompressed)
+Compressed:        ~4.4 MB (tar.gz)
+
+================================================================================
+TECHNICAL SPECIFICATIONS
+================================================================================
+
+Audio Channels:    8 (4 per chip × 2 chips)
+Polyphony:         8 simultaneous notes
+Keyboard Range:    B2 to B7 (4-5 octaves)
+MIDI Support:      Standard MIDI file format
+Timbre Options:    6 (String, Organ, Clarinet, Piano, Harpsichord, etc.)
+Envelope Types:    4 (Decay, Fast, Medium, Slow)
+Volume Levels:     4 (0dB, -6dB, -12dB, Mute)
+Drum Sounds:       5 (BD, HC, SDN, HHO, HHD)
+
+================================================================================
+RELEASE NOTES
+================================================================================
+
+This is the official v8.0 release of YM2163 Piano GUI.
+
+Major improvements in v8:
+- Dual chip support with intelligent channel allocation
+- Enhanced UI with Release phase indicators
+- Time-based progress bar for accurate playback visualization
+- Automatic silence skipping for better user experience
+- Complete channel initialization on track switching
+- Improved audio quality through better envelope handling
+
+For detailed information, see UPDATE_v8_NOTES.md
+
+================================================================================
+SUPPORT & DOCUMENTATION
+================================================================================
+
+Quick Start:     See QUICK_START_v8.md
+Full Details:    See UPDATE_v8_NOTES.md
+Configuration:   Edit ym2163_midi_config.ini
+Compilation:     Run build_v8.sh (Linux/MinGW)
+
+================================================================================
