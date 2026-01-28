@@ -2285,6 +2285,18 @@ void RenderMIDIPlayer() {
             // Remember if we were playing before seek
             bool wasPlaying = g_midiPlayer.isPlaying && !g_midiPlayer.isPaused;
 
+            // Stop all currently playing notes before seek
+            stop_all_notes();
+            g_midiPlayer.activeNotes.clear();
+            ResetPianoKeyStates();
+
+            // Reset high-precision timer and accumulated time
+            QueryPerformanceCounter(&g_midiPlayer.lastPerfCounter);
+
+            // Calculate accumulated time based on target MIDI tick
+            double ticksPerMicrosecond = (double)g_midiPlayer.ticksPerQuarterNote / g_midiPlayer.tempo;
+            g_midiPlayer.accumulatedTime = targetMidiTick / ticksPerMicrosecond;
+
             // Recalculate timing based on actual MIDI tick value
             auto now = std::chrono::steady_clock::now();
             if (wasPlaying) {
@@ -2298,10 +2310,10 @@ void RenderMIDIPlayer() {
                 g_midiPlayer.pausedDuration = std::chrono::milliseconds(0);
             }
 
-            // Stop all currently playing notes
-            stop_all_notes();
-            g_midiPlayer.activeNotes.clear();
-            ResetPianoKeyStates();
+            // Rebuild active notes state if we're at a position where notes should be playing
+            if (targetEventIndex > 0) {
+                RebuildActiveNotesAfterSeek(targetEventIndex);
+            }
 
             log_command("Seek to progress: %.1f%% (time: %s)", clickPos * 100.0f, currentTimeStr.c_str());
         }
