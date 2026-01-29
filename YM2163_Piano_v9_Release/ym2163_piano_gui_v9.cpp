@@ -139,10 +139,11 @@ static int g_nextFIFOChannel = 0;  // FIFO channel allocation index
 
 // Drum pads
 static bool g_drumPressed[5] = {false};
-static bool g_drumActive[5] = {false};  // Track drum active state
+static bool g_drumActive[2][5] = {{false}};  // Track drum active state for each chip [chipIndex][drumIndex]
 static const char* g_drumNames[] = {"BD", "HC", "SDN", "HHO", "HHD"};
 static uint8_t g_drumBits[] = {0x01, 0x02, 0x04, 0x08, 0x10};
-static std::chrono::steady_clock::time_point g_drumTriggerTime[5];
+static std::chrono::steady_clock::time_point g_drumTriggerTime[2][5];  // [chipIndex][drumIndex]
+static int g_currentDrumChip = 0;  // Track which chip to use for next drum (0 or 1)
 
 // Piano keys state
 static bool g_pianoKeyPressed[61] = {false};
@@ -237,6 +238,21 @@ static int g_pathHistoryIndex = -1;
 static int g_selectedFileIndex = -1;
 static bool g_pathEditMode = false;  // Win11-style address bar: false=breadcrumb buttons, true=text input
 static bool g_pathEditModeJustActivated = false;  // Track if edit mode was just activated this frame
+
+// Scroll position memory for each path
+static std::map<std::string, float> g_pathScrollPositions;
+static std::string g_lastExitedFolder;  // Remember which folder we just exited from (persistent until entering another folder)
+static std::string g_currentPlayingFilePath;  // Full path of currently playing MIDI file
+
+// Text scrolling for long filenames
+struct TextScrollState {
+    float scrollOffset;
+    float scrollDirection;  // 1.0 = right, -1.0 = left
+    float pauseTimer;
+    std::chrono::steady_clock::time_point lastUpdateTime;
+};
+static std::map<int, TextScrollState> g_textScrollStates;  // fileIndex -> scroll state
+static int g_hoveredFileIndex = -1;
 
 // Playlist control
 static int g_currentPlayingIndex = -1;  // Index in g_fileList
@@ -1108,34 +1124,47 @@ void InitializeAllChannels() {
         }
     }
 
-    // Reset drum states
-    for (int i = 0; i < 5; i++) {
-        g_drumActive[i] = false;
+    // Reset drum states for both chips
+    for (int chip = 0; chip < 2; chip++) {
+        for (int i = 0; i < 5; i++) {
+            g_drumActive[chip][i] = false;
+        }
     }
 }
 
 // Clean up channels in Release phase that have exceeded timeout
 void play_drum(uint8_t rhythm_bit) {
-    write_melody_cmd(0x90);
-    write_melody_cmd(rhythm_bit);
+    // Dynamic chip allocation when second chip is enabled
+    int chipIndex = 0;
+    if (g_enableSecondYM2163) {
+        chipIndex = g_currentDrumChip;
+        // Alternate between chips for next drum hit
+        g_currentDrumChip = 1 - g_currentDrumChip;
+        log_command("Drum triggered on Chip %d (next will use Chip %d)", chipIndex, g_currentDrumChip);
+    }
 
-    // Track which drums were triggered
+    write_melody_cmd_chip(0x90, chipIndex);
+    write_melody_cmd_chip(rhythm_bit, chipIndex);
+
+    // Track which drums were triggered on this specific chip
     for (int i = 0; i < 5; i++) {
         if (rhythm_bit & g_drumBits[i]) {
-            g_drumActive[i] = true;
-            g_drumTriggerTime[i] = std::chrono::steady_clock::now();
+            g_drumActive[chipIndex][i] = true;
+            g_drumTriggerTime[chipIndex][i] = std::chrono::steady_clock::now();
         }
     }
 }
 
 void UpdateDrumStates() {
-    // Auto-clear drum states after 100ms
+    // Auto-clear drum states after 100ms for each chip
     auto now = std::chrono::steady_clock::now();
-    for (int i = 0; i < 5; i++) {
-        if (g_drumActive[i]) {
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - g_drumTriggerTime[i]);
-            if (elapsed.count() > 100) {
-                g_drumActive[i] = false;
+    for (int chip = 0; chip < 2; chip++) {
+        for (int i = 0; i < 5; i++) {
+            if (g_drumActive[chip][i]) {
+                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - g_drumTriggerTime[chip][i]);
+                if (elapsed.count() > 100) {
+                    g_drumActive[chip][i] = false;
+                }
             }
         }
     }
@@ -1175,6 +1204,21 @@ std::wstring UTF8ToWide(const std::string& str) {
     std::wstring wstrTo(size_needed, 0);
     MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), &wstrTo[0], size_needed);
     return wstrTo;
+}
+
+// Truncate long folder names for address bar display (e.g., "1234...7890")
+std::string TruncateFolderName(const std::string& name, int maxLength = 20) {
+    if (name.length() <= maxLength) {
+        return name;
+    }
+
+    // Calculate how many characters to show on each side
+    int sideLength = (maxLength - 3) / 2;  // -3 for "..."
+
+    std::string prefix = name.substr(0, sideLength);
+    std::string suffix = name.substr(name.length() - sideLength);
+
+    return prefix + "..." + suffix;
 }
 
 void RefreshFileList() {
@@ -1252,6 +1296,10 @@ void NavigateToPath(const char* path) {
 
     // Convert back to UTF-8 and update current path
     std::string normalizedPath = WideToUTF8(wNormalizedPath);
+
+    // Extract folder name from current path to remember which folder we're entering
+    std::string oldPath = g_currentPath;
+
     strcpy(g_currentPath, normalizedPath.c_str());
     strcpy(g_pathInput, normalizedPath.c_str());
 
@@ -1302,6 +1350,9 @@ void NavigateToParent() {
     // Find last backslash
     char* lastSlash = strrchr(parentPath, '\\');
     if (lastSlash && lastSlash != parentPath) {
+        // Extract the folder name we're exiting from (persistent until entering another folder)
+        g_lastExitedFolder = std::string(lastSlash + 1);
+
         *lastSlash = '\0';
         NavigateToPath(parentPath);
     }
@@ -1575,9 +1626,30 @@ bool LoadMIDIFile(const char* filename) {
     std::wstring wFilename = UTF8ToWide(filename);
 
 #ifdef _WIN32
+    // Add long path prefix if path is too long (> 260 chars)
+    if (wFilename.length() > 260) {
+        // Add \\?\ prefix for long path support
+        if (wFilename.find(L"\\\\?\\") != 0) {
+            wFilename = L"\\\\?\\" + wFilename;
+        }
+    }
+
     // Use wide string version for proper Unicode path support on Windows
     if (!g_midiPlayer.midiFile.read(wFilename)) {
-        log_command("ERROR: Failed to load MIDI file: %s", filename);
+        // Try to provide more helpful error message
+        DWORD error = GetLastError();
+        if (error == ERROR_FILE_NOT_FOUND) {
+            log_command("ERROR: File not found: %s", filename);
+        } else if (error == ERROR_PATH_NOT_FOUND) {
+            log_command("ERROR: Path not found: %s", filename);
+        } else if (error == ERROR_ACCESS_DENIED) {
+            log_command("ERROR: Access denied: %s", filename);
+        } else if (wFilename.length() > 260) {
+            log_command("ERROR: Path too long (%d chars): %s", (int)strlen(filename), filename);
+            log_command("Windows MAX_PATH limit is 260 characters. Please move the file to a shorter path.");
+        } else {
+            log_command("ERROR: Failed to load MIDI file (error %d): %s", error, filename);
+        }
         return false;
     }
 #else
@@ -2466,12 +2538,20 @@ void RenderMIDIPlayer() {
                 ImGui::SameLine();
             }
 
+            // Truncate long folder names for display
+            std::string displayName = TruncateFolderName(segments[i], 20);
+
             // Create button for this segment
             char buttonId[256];
-            snprintf(buttonId, sizeof(buttonId), "%s##seg%d", segments[i].c_str(), (int)i);
+            snprintf(buttonId, sizeof(buttonId), "%s##seg%d", displayName.c_str(), (int)i);
 
             if (ImGui::Button(buttonId)) {
                 NavigateToPath(accumulatedPaths[i].c_str());
+            }
+
+            // Show full name in tooltip if truncated
+            if (displayName != segments[i] && ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("%s", segments[i].c_str());
             }
         }
 
@@ -2526,11 +2606,37 @@ void RenderMIDIPlayer() {
     // File list
     ImGui::BeginChild("FileList", ImVec2(-1, 0), true);
 
+    // Save current scroll position for this path (every frame)
+    std::string currentPathStr(g_currentPath);
+    if (strlen(g_currentPath) > 0) {
+        g_pathScrollPositions[currentPathStr] = ImGui::GetScrollY();
+    }
+
+    // Restore scroll position if we have one saved for this path (only once after navigation)
+    static std::string lastRestoredPath;
+    if (currentPathStr != lastRestoredPath && g_pathScrollPositions.count(currentPathStr) > 0) {
+        ImGui::SetScrollY(g_pathScrollPositions[currentPathStr]);
+        lastRestoredPath = currentPathStr;
+    }
+
     for (int i = 0; i < (int)g_fileList.size(); i++) {
         const FileEntry& entry = g_fileList[i];
 
         bool isSelected = (g_selectedFileIndex == i);
-        ImGuiSelectableFlags flags = ImGuiSelectableFlags_AllowDoubleClick;
+
+        // Check if this folder is the one we just exited from (persistent highlight)
+        bool isExitedFolder = (!g_lastExitedFolder.empty() && entry.isDirectory && entry.name == g_lastExitedFolder);
+
+        // Check if this is the folder containing the currently playing file, or a parent folder in the path
+        bool isPlayingPath = false;
+        if (!g_currentPlayingFilePath.empty() && entry.isDirectory) {
+            // Check if the playing file is in this directory or a subdirectory
+            std::string entryPath = entry.fullPath;
+            if (entryPath.back() != '\\') entryPath += "\\";
+            if (g_currentPlayingFilePath.find(entryPath) == 0) {
+                isPlayingPath = true;
+            }
+        }
 
         // Build label with icon prefix using std::string to properly handle UTF-8
         std::string label;
@@ -2542,18 +2648,147 @@ void RenderMIDIPlayer() {
             label = entry.name;
         }
 
-        if (ImGui::Selectable(label.c_str(), isSelected, flags)) {
-            g_selectedFileIndex = i;
+        // Apply highlight colors
+        if (isExitedFolder) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.8f, 0.2f, 1.0f));  // Yellow highlight for exited folder
+        } else if (isPlayingPath) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.7f, 1.0f, 1.0f));  // Light blue for playing path
+        }
 
-            // Double-click handling
-            if (ImGui::IsMouseDoubleClicked(0)) {
+        // Check if text is too long and needs scrolling
+        ImVec2 textSize = ImGui::CalcTextSize(label.c_str());
+        float availWidth = ImGui::GetContentRegionAvail().x;
+        bool needsScrolling = textSize.x > availWidth;
+
+        // Track hover state
+        bool isHovered = false;
+
+        // Enable scrolling for selected, exited folder, or hovered items
+        if (needsScrolling) {
+            // Use custom rendering for scrolling text
+            ImVec2 cursorPos = ImGui::GetCursorScreenPos();
+            ImVec2 itemSize = ImVec2(availWidth, ImGui::GetTextLineHeightWithSpacing());
+
+            // Invisible button for interaction
+            ImGui::InvisibleButton(("##item" + std::to_string(i)).c_str(), itemSize);
+            isHovered = ImGui::IsItemHovered();
+
+            if (ImGui::IsItemClicked()) {
+                g_selectedFileIndex = i;
+
+                // Single-click handling
                 if (entry.name == "..") {
                     NavigateToParent();
                 } else if (entry.isDirectory) {
+                    g_lastExitedFolder.clear();
+                    NavigateToPath(entry.fullPath.c_str());
+                } else {
+                    g_currentPlayingIndex = i;
+                    g_currentPlayingFilePath = entry.fullPath;
+                    ResetAllYM2163Chips();
+                    InitializeAllChannels();
+                    stop_all_notes();
+                    g_midiPlayer.activeNotes.clear();
+                    ResetPianoKeyStates();
+                    if (LoadMIDIFile(entry.fullPath.c_str())) {
+                        g_midiPlayer.currentTick = 0;
+                        g_midiPlayer.pausedDuration = std::chrono::milliseconds(0);
+                        PlayMIDI();
+                    }
+                }
+            }
+
+            // Only animate scrolling if item is selected, exited folder, or hovered
+            bool shouldScroll = (isSelected || isExitedFolder || isHovered);
+
+            if (shouldScroll) {
+                // Initialize scroll state if needed
+                if (g_textScrollStates.count(i) == 0) {
+                    TextScrollState state;
+                    state.scrollOffset = 0.0f;
+                    state.scrollDirection = 1.0f;
+                    state.pauseTimer = 1.0f;
+                    state.lastUpdateTime = std::chrono::steady_clock::now();
+                    g_textScrollStates[i] = state;
+                }
+
+                TextScrollState& scrollState = g_textScrollStates[i];
+                auto now = std::chrono::steady_clock::now();
+                float deltaTime = std::chrono::duration<float>(now - scrollState.lastUpdateTime).count();
+                scrollState.lastUpdateTime = now;
+
+                // Update scroll animation
+                if (scrollState.pauseTimer > 0.0f) {
+                    scrollState.pauseTimer -= deltaTime;
+                } else {
+                    float scrollSpeed = 30.0f;  // pixels per second
+                    scrollState.scrollOffset += scrollState.scrollDirection * scrollSpeed * deltaTime;
+
+                    float maxScroll = textSize.x - availWidth + 20.0f;
+                    if (scrollState.scrollOffset >= maxScroll) {
+                        scrollState.scrollOffset = maxScroll;
+                        scrollState.scrollDirection = -1.0f;
+                        scrollState.pauseTimer = 1.0f;
+                    } else if (scrollState.scrollOffset <= 0.0f) {
+                        scrollState.scrollOffset = 0.0f;
+                        scrollState.scrollDirection = 1.0f;
+                        scrollState.pauseTimer = 1.0f;
+                    }
+                }
+
+                // Draw background for selected item
+                ImDrawList* drawList = ImGui::GetWindowDrawList();
+                if (isSelected) {
+                    ImU32 bgColor = ImGui::GetColorU32(ImGuiCol_Header);
+                    drawList->AddRectFilled(cursorPos, ImVec2(cursorPos.x + availWidth, cursorPos.y + itemSize.y), bgColor);
+                } else if (isHovered) {
+                    ImU32 bgColor = ImGui::GetColorU32(ImGuiCol_HeaderHovered);
+                    drawList->AddRectFilled(cursorPos, ImVec2(cursorPos.x + availWidth, cursorPos.y + itemSize.y), bgColor);
+                }
+
+                // Clip text rendering
+                drawList->PushClipRect(cursorPos, ImVec2(cursorPos.x + availWidth, cursorPos.y + itemSize.y), true);
+                ImVec2 textPos = ImVec2(cursorPos.x - scrollState.scrollOffset, cursorPos.y);
+                ImU32 textColor = ImGui::GetColorU32(ImGuiCol_Text);
+                drawList->AddText(textPos, textColor, label.c_str());
+                drawList->PopClipRect();
+            } else {
+                // Not scrolling, just draw static text
+                ImDrawList* drawList = ImGui::GetWindowDrawList();
+                if (isSelected) {
+                    ImU32 bgColor = ImGui::GetColorU32(ImGuiCol_Header);
+                    drawList->AddRectFilled(cursorPos, ImVec2(cursorPos.x + availWidth, cursorPos.y + itemSize.y), bgColor);
+                } else if (isHovered) {
+                    ImU32 bgColor = ImGui::GetColorU32(ImGuiCol_HeaderHovered);
+                    drawList->AddRectFilled(cursorPos, ImVec2(cursorPos.x + availWidth, cursorPos.y + itemSize.y), bgColor);
+                }
+
+                // Draw text without scrolling
+                ImU32 textColor = ImGui::GetColorU32(ImGuiCol_Text);
+                drawList->AddText(cursorPos, textColor, label.c_str());
+
+                // Reset scroll state when not scrolling
+                if (g_textScrollStates.count(i) > 0) {
+                    g_textScrollStates.erase(i);
+                }
+            }
+
+        } else {
+            // Normal selectable for short text
+            if (ImGui::Selectable(label.c_str(), isSelected)) {
+                g_selectedFileIndex = i;
+
+                // Single-click handling (unified with history folder behavior)
+                if (entry.name == "..") {
+                    NavigateToParent();
+                } else if (entry.isDirectory) {
+                    // Clear the exited folder highlight when entering any folder
+                    g_lastExitedFolder.clear();
                     NavigateToPath(entry.fullPath.c_str());
                 } else {
                     // Load MIDI file and start playing immediately
                     g_currentPlayingIndex = i;  // Update current playing index
+                    g_currentPlayingFilePath = entry.fullPath;  // Store full path of playing file
 
                     // Reset YM2163 chips to eliminate residual sound
                     ResetAllYM2163Chips();
@@ -2568,10 +2803,20 @@ void RenderMIDIPlayer() {
                         // Reset progress bar
                         g_midiPlayer.currentTick = 0;
                         g_midiPlayer.pausedDuration = std::chrono::milliseconds(0);
-                        PlayMIDI();  // Auto-play on double-click
+                        PlayMIDI();  // Auto-play on single-click
                     }
                 }
             }
+            isHovered = ImGui::IsItemHovered();
+        }
+
+        // Track hovered item
+        if (isHovered) {
+            g_hoveredFileIndex = i;
+        }
+
+        if (isExitedFolder || isPlayingPath) {
+            ImGui::PopStyleColor();
         }
     }
 
@@ -2794,7 +3039,7 @@ void RenderChannelStatus() {
     ImGui::Text("Drums:");
     ImGui::SameLine();
     for (int i = 0; i < 5; i++) {
-        if (g_drumActive[i]) {
+        if (g_drumActive[0][i]) {  // Chip 0 drums
             ImGui::TextColored(drumActiveColor, "%s", g_drumNames[i]);
         } else {
             ImGui::TextDisabled("%s", g_drumNames[i]);
@@ -2847,7 +3092,7 @@ void RenderChannelStatus() {
     ImGui::Text("Drums:");
     ImGui::SameLine();
     for (int i = 0; i < 5; i++) {
-        if (g_drumActive[i]) {
+        if (g_drumActive[1][i]) {  // Chip 1 drums
             ImGui::TextColored(drumActiveColor, "%s", g_drumNames[i]);
         } else {
             ImGui::TextDisabled("%s", g_drumNames[i]);
